@@ -1,481 +1,563 @@
 #!/usr/bin/env python3
-"""
-Manual SAM Hive Parser for NSSECU3 MP3
-- No registry parser libraries used
-- Reads the hive as raw bytes
-- Traverses SAM\\Domains\\Account\\Users
-- Enumerates RID keys and Names mapping
-- Extracts F and V raw value data
-
-Author: Jose Angelo / Group
-"""
-
 import sys
 import struct
-import argparse
 from datetime import datetime, timedelta
-
 
 REGF_MAGIC = b"regf"
 HBIN_MAGIC = b"hbin"
-NK_SIG = b"nk"
-VK_SIG = b"vk"
+NK_MAGIC = b"nk"
+VK_MAGIC = b"vk"
 
-SUBKEY_LIST_SIGS = {b"lf", b"lh", b"li", b"ri"}
+FIRST_HBIN_ABS = 0x1000
 
 
-def filetime_to_dt(ft):
+def u16(data, off):
+    return struct.unpack_from("<H", data, off)[0]
+
+
+def u32(data, off):
+    return struct.unpack_from("<I", data, off)[0]
+
+
+def i32(data, off):
+    return struct.unpack_from("<i", data, off)[0]
+
+
+def u64(data, off):
+    return struct.unpack_from("<Q", data, off)[0]
+
+
+def filetime_to_str(ft):
     if ft == 0:
-        return None
+        return "0"
     try:
-        return datetime(1601, 1, 1) + timedelta(microseconds=ft / 10)
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft / 10)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return None
+        return str(ft)
 
 
-def safe_hex(data, limit=64):
-    if data is None:
+def is_printable_ascii(bs):
+    return bool(bs) and all(0x20 <= b <= 0x7E for b in bs)
+
+
+def decode_name(raw):
+    if not raw:
         return ""
-    return data[:limit].hex()
+
+    if is_printable_ascii(raw):
+        return raw.decode("ascii", errors="ignore")
+
+    try:
+        s = raw.decode("utf-16le", errors="ignore").rstrip("\x00")
+        if s and any(ch.isalnum() for ch in s):
+            return s
+    except Exception:
+        pass
+
+    return raw.decode("ascii", errors="ignore").rstrip("\x00")
 
 
-class RegistryHive:
+def rel_to_abs(rel_off):
+    if rel_off == 0xFFFFFFFF:
+        return None
+    return FIRST_HBIN_ABS + rel_off
+
+
+class NKRecord:
+    def __init__(
+        self,
+        abs_off,
+        rel_off,
+        parent_rel,
+        name,
+        flags,
+        subkey_count,
+        subkey_list_rel,
+        value_count,
+        value_list_rel,
+        timestamp,
+    ):
+        self.abs_off = abs_off
+        self.rel_off = rel_off
+        self.parent_rel = parent_rel
+        self.name = name
+        self.flags = flags
+        self.subkey_count = subkey_count
+        self.subkey_list_rel = subkey_list_rel
+        self.value_count = value_count
+        self.value_list_rel = value_list_rel
+        self.timestamp = timestamp
+
+
+class VKRecord:
+    def __init__(self, abs_off, rel_off, name, value_type, data_len, data_rel, inline, data):
+        self.abs_off = abs_off
+        self.rel_off = rel_off
+        self.name = name
+        self.value_type = value_type
+        self.data_len = data_len
+        self.data_rel = data_rel
+        self.inline = inline
+        self.data = data
+
+
+class SAMParser:
     def __init__(self, path):
         self.path = path
         with open(path, "rb") as f:
             self.data = f.read()
 
-        self.root_rel = None
-        self.root_abs = None
-        self.hbins_size = None
+        self.hbins = []
+        self.nks = []
+        self.nk_by_rel = {}
 
-    # ----------------------------
-    # Basic helpers
-    # ----------------------------
-    def rel_to_abs(self, rel_off):
-        if rel_off in (0xFFFFFFFF,):
-            return None
-        return 0x1000 + rel_off
-
-    def abs_to_rel(self, abs_off):
-        return abs_off - 0x1000
-
-    def read_u16(self, off):
-        return struct.unpack_from("<H", self.data, off)[0]
-
-    def read_u32(self, off):
-        return struct.unpack_from("<I", self.data, off)[0]
-
-    def read_i32(self, off):
-        return struct.unpack_from("<i", self.data, off)[0]
-
-    def read_u64(self, off):
-        return struct.unpack_from("<Q", self.data, off)[0]
-
-    def decode_name(self, raw, compressed=False):
-        if raw is None:
-            return ""
-        try:
-            if compressed:
-                return raw.decode("latin-1", errors="ignore").rstrip("\x00")
-            return raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
-        except Exception:
-            return ""
-
-    # ----------------------------
-    # Hive header
-    # ----------------------------
     def parse_header(self):
         if self.data[0:4] != REGF_MAGIC:
-            raise ValueError("Not a valid registry hive: missing 'regf'")
+            raise ValueError("Not a valid registry hive (missing regf)")
 
-        seq1 = self.read_u32(0x04)
-        seq2 = self.read_u32(0x08)
-        last_write_ft = self.read_u64(0x0C)
-        major = self.read_u32(0x14)
-        minor = self.read_u32(0x18)
-        self.root_rel = self.read_u32(0x24)
-        self.root_abs = self.rel_to_abs(self.root_rel)
-        self.hbins_size = self.read_u32(0x28)
+        seq1 = u32(self.data, 0x04)
+        seq2 = u32(self.data, 0x08)
+        last_write_ft = u64(self.data, 0x0C)
+        major = u32(self.data, 0x14)
+        minor = u32(self.data, 0x18)
+        root_cell_rel = u32(self.data, 0x24)
+        hive_bins_size = u32(self.data, 0x28)
 
         print("[*] Registry hive header")
-        print(f"    Magic         : regf")
+        print(f"    Magic         : {self.data[0:4].decode(errors='ignore')}")
         print(f"    Sequence      : {seq1}:{seq2}")
-        print(f"    Last write    : {filetime_to_dt(last_write_ft)}")
+        print(f"    Last write    : {filetime_to_str(last_write_ft)}")
         print(f"    Version       : {major}.{minor}")
-        print(f"    Root cell rel : 0x{self.root_rel:08X}")
-        print(f"    Root cell abs : 0x{self.root_abs:08X}")
-        print(f"    HBIN area size: 0x{self.hbins_size:08X}")
+        print(f"    Root cell rel : 0x{root_cell_rel:08X}")
+        print(f"    Root cell abs : 0x{root_cell_rel + FIRST_HBIN_ABS:08X}")
+        print(f"    HBIN area size: 0x{hive_bins_size:08X}")
 
-    # ----------------------------
-    # HBIN walking
-    # ----------------------------
-    def iter_hbins(self):
-        off = 0x1000
+    def parse_hbins(self):
+        print("\n[*] Enumerating HBIN blocks")
+
+        off = FIRST_HBIN_ABS
         while off + 0x20 <= len(self.data):
             if self.data[off:off + 4] != HBIN_MAGIC:
                 break
 
-            rel_off = self.read_u32(off + 0x04)
-            size = self.read_u32(off + 0x08)
+            rel = u32(self.data, off + 0x04)
+            size = u32(self.data, off + 0x08)
 
-            yield {
-                "abs_off": off,
-                "rel_off": rel_off,
-                "size": size,
-            }
-
-            if size <= 0:
+            if size == 0:
                 break
+
+            self.hbins.append((off, rel, size))
             off += size
 
-    def print_hbins(self):
-        hbins = list(self.iter_hbins())
-        print(f"[*] Found {len(hbins)} HBIN block(s)")
-        for i, hb in enumerate(hbins):
-            print(
-                f"    HBIN[{i}] abs=0x{hb['abs_off']:08X} rel=0x{hb['rel_off']:08X} size=0x{hb['size']:08X}"
-            )
+        print(f"[*] Found {len(self.hbins)} HBIN block(s)")
+        for i, (abs_off, rel, size) in enumerate(self.hbins):
+            print(f"    HBIN[{i}] abs=0x{abs_off:08X} rel=0x{rel:08X} size=0x{size:08X}")
 
-    # ----------------------------
-    # Cell parsing
-    # ----------------------------
-    def get_cell_size(self, abs_off):
-        if abs_off is None or abs_off + 4 > len(self.data):
-            return None
-        return self.read_i32(abs_off)
-
-    def is_allocated_cell(self, abs_off):
-        sz = self.get_cell_size(abs_off)
-        return sz is not None and sz < 0
-
-    def parse_nk(self, abs_off):
-        if abs_off is None or abs_off + 0x54 > len(self.data):
-            return None
-
-        cell_size = self.read_i32(abs_off)
-        if cell_size >= 0:
-            return None
-
-        sig = self.data[abs_off + 4:abs_off + 6]
-        if sig != NK_SIG:
-            return None
-
-        flags = self.read_u16(abs_off + 0x06)
-        last_write_ft = self.read_u64(abs_off + 0x08)
-        parent_rel = self.read_u32(abs_off + 0x10)
-
-        num_subkeys = self.read_u32(abs_off + 0x14)
-        subkey_list_rel = self.read_u32(abs_off + 0x1C)
-
-        num_values = self.read_u32(abs_off + 0x24)
-        value_list_rel = self.read_u32(abs_off + 0x28)
-
-        sk_rel = self.read_u32(abs_off + 0x2C)
-        classname_rel = self.read_u32(abs_off + 0x30)
-
-        key_name_len = self.read_u16(abs_off + 0x4C)
-        class_name_len = self.read_u16(abs_off + 0x4E)
-
-        compressed = bool(flags & 0x0020)
-        name_raw = self.data[abs_off + 0x50:abs_off + 0x50 + key_name_len]
-        name = self.decode_name(name_raw, compressed=compressed)
-
-        return {
-            "abs_off": abs_off,
-            "rel_off": self.abs_to_rel(abs_off),
-            "cell_size": cell_size,
-            "flags": flags,
-            "last_write": filetime_to_dt(last_write_ft),
-            "parent_rel": parent_rel,
-            "parent_abs": self.rel_to_abs(parent_rel),
-            "num_subkeys": num_subkeys,
-            "subkey_list_rel": subkey_list_rel,
-            "subkey_list_abs": self.rel_to_abs(subkey_list_rel),
-            "num_values": num_values,
-            "value_list_rel": value_list_rel,
-            "value_list_abs": self.rel_to_abs(value_list_rel),
-            "sk_rel": sk_rel,
-            "classname_rel": classname_rel,
-            "key_name_len": key_name_len,
-            "class_name_len": class_name_len,
-            "compressed_name": compressed,
-            "name": name,
-        }
-
-    def parse_vk(self, abs_off):
-        if abs_off is None or abs_off + 0x18 > len(self.data):
-            return None
-
-        cell_size = self.read_i32(abs_off)
-        if cell_size >= 0:
-            return None
-
-        sig = self.data[abs_off + 4:abs_off + 6]
-        if sig != VK_SIG:
-            return None
-
-        name_len = self.read_u16(abs_off + 0x06)
-        data_len_raw = self.read_u32(abs_off + 0x08)
-        data_off_field = self.read_u32(abs_off + 0x0C)
-        data_type = self.read_u32(abs_off + 0x10)
-        flags = self.read_u16(abs_off + 0x14)
-
-        compressed = bool(flags & 0x0001)
-        name_raw = self.data[abs_off + 0x18:abs_off + 0x18 + name_len]
-        name = self.decode_name(name_raw, compressed=compressed)
-
-        inline = bool(data_len_raw & 0x80000000)
-        data_len = data_len_raw & 0x7FFFFFFF
-
-        if inline:
-            data = struct.pack("<I", data_off_field)[:data_len]
-            data_abs = None
-        else:
-            data_abs = self.rel_to_abs(data_off_field)
-            if data_abs is None or data_abs + data_len > len(self.data):
-                data = None
-            else:
-                data = self.data[data_abs:data_abs + data_len]
-
-        return {
-            "abs_off": abs_off,
-            "rel_off": self.abs_to_rel(abs_off),
-            "cell_size": cell_size,
-            "name_len": name_len,
-            "data_len": data_len,
-            "data_len_raw": data_len_raw,
-            "data_off_field": data_off_field,
-            "data_abs": data_abs,
-            "data_type": data_type,
-            "flags": flags,
-            "compressed_name": compressed,
-            "name": name,
-            "data": data,
-            "inline": inline,
-        }
-
-    # ----------------------------
-    # Subkey list parsing
-    # ----------------------------
-    def parse_subkey_list(self, abs_off):
-        if abs_off is None or abs_off + 4 > len(self.data):
-            return []
-
-        cell_size = self.read_i32(abs_off)
-        if cell_size >= 0:
-            return []
-
-        sig = self.data[abs_off + 4:abs_off + 6]
-        if sig not in SUBKEY_LIST_SIGS:
-            return []
-
-        count = self.read_u16(abs_off + 0x06)
-        entries = []
-
-        if sig in (b"lf", b"lh"):
-            # each entry = 4-byte rel offset + 4-byte hash
-            base = abs_off + 0x08
-            for i in range(count):
-                rel = self.read_u32(base + i * 8)
-                entries.append(self.rel_to_abs(rel))
-
-        elif sig == b"li":
-            # each entry = 4-byte rel offset
-            base = abs_off + 0x08
-            for i in range(count):
-                rel = self.read_u32(base + i * 4)
-                entries.append(self.rel_to_abs(rel))
-
-        elif sig == b"ri":
-            # each entry points to another subkey list
-            base = abs_off + 0x08
-            for i in range(count):
-                rel = self.read_u32(base + i * 4)
-                nested_abs = self.rel_to_abs(rel)
-                entries.extend(self.parse_subkey_list(nested_abs))
-
-        return [e for e in entries if e is not None]
-
-    def get_subkeys(self, nk):
-        if not nk or nk["subkey_list_abs"] is None:
-            return []
-
-        subkey_abs_list = self.parse_subkey_list(nk["subkey_list_abs"])
-        out = []
-        for sk_abs in subkey_abs_list:
-            sk = self.parse_nk(sk_abs)
-            if sk:
-                out.append(sk)
-        return out
-
-    def get_values(self, nk):
-        if not nk or nk["value_list_abs"] is None or nk["num_values"] == 0:
-            return []
-
-        out = []
-        base = nk["value_list_abs"]
-
-        for i in range(nk["num_values"]):
-            if base + i * 4 + 4 > len(self.data):
-                break
-            rel = self.read_u32(base + i * 4)
-            abs_off = self.rel_to_abs(rel)
-            vk = self.parse_vk(abs_off)
-            if vk:
-                out.append(vk)
-
-        return out
-
-    # ----------------------------
-    # Tree walking
-    # ----------------------------
-    def get_root_key(self):
-        return self.parse_nk(self.root_abs)
-
-    def find_subkey_by_name(self, nk, target_name):
-        for sk in self.get_subkeys(nk):
-            if sk["name"].lower() == target_name.lower():
-                return sk
-        return None
-
-    def find_key_by_path(self, path_parts):
-        cur = self.get_root_key()
-        if not cur:
-            return None
-
-        # If first part matches root name, skip it
-        parts = list(path_parts)
-        if parts and cur["name"].lower() == parts[0].lower():
-            parts = parts[1:]
-
-        for part in parts:
-            cur = self.find_subkey_by_name(cur, part)
-            if not cur:
+    def try_parse_nk(self, cell_abs):
+        try:
+            cell_size = i32(self.data, cell_abs)
+            if cell_size >= 0:
                 return None
-        return cur
 
-    # ----------------------------
-    # SAM-specific helpers
-    # ----------------------------
-    def list_users(self):
-        users_key = self.find_key_by_path(["SAM", "Domains", "Account", "Users"])
-        if not users_key:
-            print("[-] Could not find SAM\\Domains\\Account\\Users")
+            if self.data[cell_abs + 4:cell_abs + 6] != NK_MAGIC:
+                return None
+
+            flags = u16(self.data, cell_abs + 0x06)
+            timestamp = u64(self.data, cell_abs + 0x08)
+            parent_rel = u32(self.data, cell_abs + 0x14)
+            subkey_count = u32(self.data, cell_abs + 0x18)
+            subkey_list_rel = u32(self.data, cell_abs + 0x20)
+            value_count = u32(self.data, cell_abs + 0x24)
+            value_list_rel = u32(self.data, cell_abs + 0x28)
+
+            name_len = u16(self.data, cell_abs + 0x4C)
+            name_start = cell_abs + 0x50
+            name_end = name_start + name_len
+
+            if name_end > len(self.data):
+                return None
+
+            raw_name = self.data[name_start:name_end]
+            name = decode_name(raw_name).strip()
+            if not name:
+                return None
+
+            rel_off = cell_abs - FIRST_HBIN_ABS
+
+            return NKRecord(
+                abs_off=cell_abs,
+                rel_off=rel_off,
+                parent_rel=parent_rel,
+                name=name,
+                flags=flags,
+                subkey_count=subkey_count,
+                subkey_list_rel=subkey_list_rel,
+                value_count=value_count,
+                value_list_rel=value_list_rel,
+                timestamp=timestamp,
+            )
+        except Exception:
+            return None
+
+    def scan_nks(self):
+        print("\n[*] Scanning HBIN cells for NK records")
+
+        for hbin_abs, _, hbin_size in self.hbins:
+            cell = hbin_abs + 0x20
+            hbin_end = hbin_abs + hbin_size
+
+            while cell + 4 <= hbin_end and cell + 4 <= len(self.data):
+                try:
+                    raw_size = i32(self.data, cell)
+                except Exception:
+                    break
+
+                if raw_size == 0:
+                    break
+
+                step = abs(raw_size)
+                if step < 4:
+                    break
+
+                nk = self.try_parse_nk(cell)
+                if nk:
+                    self.nks.append(nk)
+
+                cell += step
+
+        self.nk_by_rel = {nk.rel_off: nk for nk in self.nks}
+        print(f"[*] Total NK records found: {len(self.nks)}")
+
+    def show_sample_names(self):
+        print("\n[*] Sample parsed NK names")
+        for nk in self.nks[:40]:
+            print(f"    rel=0x{nk.rel_off:08X}  name={repr(nk.name)}")
+
+    def get_path(self, nk):
+        parts = []
+        seen = set()
+        cur = nk
+
+        while cur is not None:
+            if cur.rel_off in seen:
+                break
+            seen.add(cur.rel_off)
+
+            parts.append(cur.name)
+
+            if cur.parent_rel == 0xFFFFFFFF or cur.parent_rel not in self.nk_by_rel:
+                break
+
+            parent = self.nk_by_rel.get(cur.parent_rel)
+            if parent is None or parent == cur:
+                break
+            cur = parent
+
+        parts.reverse()
+        return "\\".join(parts)
+
+    def parse_vk(self, vk_abs):
+        try:
+            cell_size = i32(self.data, vk_abs)
+            if cell_size >= 0:
+                return None
+
+            if self.data[vk_abs + 4:vk_abs + 6] != VK_MAGIC:
+                return None
+
+            name_len = u16(self.data, vk_abs + 0x06)
+            data_len_raw = u32(self.data, vk_abs + 0x08)
+            data_rel = u32(self.data, vk_abs + 0x0C)
+            value_type = u32(self.data, vk_abs + 0x10)
+            flags = u16(self.data, vk_abs + 0x14)
+
+            name_start = vk_abs + 0x18
+            name_end = name_start + name_len
+            if name_end > len(self.data):
+                return None
+
+            raw_name = self.data[name_start:name_end]
+
+            if flags & 0x0001:
+                name = raw_name.decode("ascii", errors="ignore").rstrip("\x00")
+            else:
+                name = decode_name(raw_name)
+
+            inline = bool(data_len_raw & 0x80000000)
+            data_len = data_len_raw & 0x7FFFFFFF
+
+            data = b""
+            if inline:
+                data = struct.pack("<I", data_rel)[:data_len]
+            else:
+                data_abs = rel_to_abs(data_rel)
+                if data_abs is not None and data_len > 0 and data_abs + data_len <= len(self.data):
+                    data = self.data[data_abs:data_abs + data_len]
+
+            rel_off = vk_abs - FIRST_HBIN_ABS
+            return VKRecord(
+                abs_off=vk_abs,
+                rel_off=rel_off,
+                name=name,
+                value_type=value_type,
+                data_len=data_len,
+                data_rel=data_rel,
+                inline=inline,
+                data=data,
+            )
+        except Exception:
+            return None
+
+    def get_vk_list_for_nk(self, nk):
+        vks = []
+
+        if nk.value_count == 0 or nk.value_list_rel in (0, 0xFFFFFFFF):
+            return vks
+
+        value_list_abs = rel_to_abs(nk.value_list_rel)
+        if value_list_abs is None:
+            return vks
+
+        for i in range(nk.value_count):
+            entry_off = value_list_abs + (i * 4)
+            if entry_off + 4 > len(self.data):
+                break
+
+            vk_rel = u32(self.data, entry_off)
+            if vk_rel == 0xFFFFFFFF:
+                continue
+
+            vk_abs = rel_to_abs(vk_rel)
+            if vk_abs is None or vk_abs + 4 > len(self.data):
+                continue
+
+            vk = self.parse_vk(vk_abs)
+            if vk:
+                vks.append(vk)
+
+        return vks
+
+    def parse_user_v_value(self, vdata):
+        """
+        Parse the V value using common Windows SAM offsets.
+        Offsets (all relative to start of V data):
+        0x00: username length (2 bytes)
+        0x0C: username offset (2 bytes)
+        0x1C: LM hash offset (2 bytes)
+        0x1E: LM hash length (2 bytes)
+        0x20: NT hash offset (2 bytes)
+        0x22: NT hash length (2 bytes)
+        The username is UTF-16LE at offset.
+        Full name and comment are optional; we can add them later.
+        """
+        if len(vdata) < 0x24:
+            return None
+
+        username_len = u16(vdata, 0x00)
+        username_off = u16(vdata, 0x0C)
+        lm_off = u16(vdata, 0x1C)
+        lm_len = u16(vdata, 0x1E)
+        nt_off = u16(vdata, 0x20)
+        nt_len = u16(vdata, 0x22)
+
+        username = ""
+        if username_len > 0 and username_off + username_len <= len(vdata):
+            username = vdata[username_off:username_off+username_len].decode("utf-16le", errors="ignore").rstrip("\x00")
+
+        lm_blob = vdata[lm_off:lm_off+lm_len] if lm_len > 0 else b""
+        nt_blob = vdata[nt_off:nt_off+nt_len] if nt_len > 0 else b""
+
+        return {
+            "username": username,
+            "full_name": "",
+            "comment": "",
+            "lm_blob": lm_blob,
+            "nt_blob": nt_blob,
+        }
+
+    def show_structure_hits(self):
+        print("\n[*] Reconstructed key paths of interest")
+
+        interesting = []
+        for nk in self.nks:
+            path = self.get_path(nk)
+            if (
+                path.endswith("SAM\\Domains\\Account")
+                or path.endswith("SAM\\Domains\\Account\\Users")
+                or path.endswith("SAM\\Domains\\Account\\Users\\Names")
+                or path.endswith("SAM\\Domains\\Builtin")
+            ):
+                interesting.append((path, nk))
+
+        if not interesting:
+            print("    No exact reconstructed paths found.")
             return
 
-        print("\n[*] Located key: SAM\\Domains\\Account\\Users")
-        print(f"    Offset : 0x{users_key['abs_off']:08X}")
-        print(f"    Subkeys: {users_key['num_subkeys']}")
-        print(f"    Values : {users_key['num_values']}")
+        for path, nk in interesting:
+            print(
+                f"    {path}  "
+                f"(rel=0x{nk.rel_off:08X}, subkeys={nk.subkey_count}, values={nk.value_count})"
+            )
 
-        subkeys = self.get_subkeys(users_key)
+    def extract_user_accounts(self):
+        print("\n[*] Extracting user account data from RID-style keys")
 
-        rid_keys = []
-        names_key = None
+        found_any = False
 
-        for sk in subkeys:
-            nm = sk["name"]
-            if nm.lower() == "names":
-                names_key = sk
-            elif len(nm) == 8 and all(c in "0123456789abcdefABCDEF" for c in nm):
-                rid_keys.append(sk)
+        for nk in self.nks:
+            if len(nk.name) != 8:
+                continue
 
-        print(f"\n[*] RID subkeys found: {len(rid_keys)}")
-        for rk in sorted(rid_keys, key=lambda x: x["name"]):
-            print(f"    {rk['name']}  abs=0x{rk['abs_off']:08X}")
+            try:
+                rid = int(nk.name, 16)
+            except ValueError:
+                continue
 
-        # Username -> RID map via Users\Names
-        username_to_rid = {}
-        if names_key:
-            print(f"\n[*] Located key: SAM\\Domains\\Account\\Users\\Names")
-            print(f"    Offset : 0x{names_key['abs_off']:08X}")
-            for name_subkey in self.get_subkeys(names_key):
-                username = name_subkey["name"]
-                vals = self.get_values(name_subkey)
+            path = self.get_path(nk)
+            if "SAM\\Domains\\Account\\Users" not in path:
+                continue
 
-                # Default value has empty name ""
-                rid = None
-                for v in vals:
-                    if v["name"] == "" and v["data"] and len(v["data"]) >= 4:
-                        rid = struct.unpack_from("<I", v["data"], 0)[0]
-                        break
+            vks = self.get_vk_list_for_nk(nk)
+            if not vks:
+                continue
 
-                username_to_rid[username] = rid
+            found_any = True
+            print(f"\n[+] RID key: {nk.name} (RID {rid})")
+            print(f"    Path      : {path}")
+            print(f"    Timestamp : {filetime_to_str(nk.timestamp)}")
+            print(f"    Values    : {len(vks)}")
 
-            print("\n[*] Username -> RID mapping")
-            for uname, rid in sorted(username_to_rid.items()):
-                rid_hex = f"{rid:08X}" if rid is not None else "UNKNOWN"
-                print(f"    {uname} -> {rid_hex}")
+            f_vk = None
+            v_vk = None
+
+            for vk in vks:
+                shown_name = vk.name if vk.name else "(default)"
+                print(
+                    f"      VK name={shown_name!r} "
+                    f"type={vk.value_type} len={vk.data_len} inline={vk.inline}"
+                )
+                if vk.name == "F":
+                    f_vk = vk
+                elif vk.name == "V":
+                    v_vk = vk
+
+            if f_vk:
+                print(f"      F bytes (first 32): {f_vk.data[:32].hex()}")
+
+            if v_vk:
+                parsed_v = self.parse_user_v_value(v_vk.data)
+                print(f"      V bytes (first 32): {v_vk.data[:32].hex()}")
+
+                if parsed_v:
+                    print(f"      Username  : {parsed_v['username']}")
+                    if parsed_v["full_name"]:
+                        print(f"      Full name : {parsed_v['full_name']}")
+                    if parsed_v["comment"]:
+                        print(f"      Comment   : {parsed_v['comment']}")
+
+                    if parsed_v["lm_blob"]:
+                        print(f"      LM blob   : {parsed_v['lm_blob'].hex()}")
+                    else:
+                        print("      LM blob   : <empty>")
+
+                    if parsed_v["nt_blob"]:
+                        print(f"      NT blob   : {parsed_v['nt_blob'].hex()}")
+                    else:
+                        print("      NT blob   : <empty>")
+                else:
+                    print("      Could not parse V structure with current offsets.")
+                    print("      Full V data hex (for manual analysis):")
+                    # Print in 16-byte rows for readability
+                    for i in range(0, len(v_vk.data), 16):
+                        chunk = v_vk.data[i:i+16]
+                        hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                        print(f"        {i:04x}: {hex_part:<47} {ascii_part}")
+                    print("      Use this to locate the username (as UTF-16LE) and hashes.")
+                    print("      Then adjust offsets in parse_user_v_value().")
+
+        if not found_any:
+            print("    No RID-style account keys with readable values were extracted.")
+            print("    This can still happen if some offsets differ across versions.")
+            print("    Use HxD + Excel to verify F and V manually.")
+
+    def search_interesting(self):
+        print("\n[*] Searching for interesting names directly")
+
+        exact_targets = {
+            "SAM", "Domains", "Account", "Users", "Names",
+            "Administrator", "Guest", "DefaultAccount"
+        }
+
+        found_exact = []
+        found_rids = []
+        found_probable_users = []
+
+        for nk in self.nks:
+            if nk.name in exact_targets:
+                found_exact.append(nk)
+
+            if len(nk.name) == 8:
+                try:
+                    rid = int(nk.name, 16)
+                    found_rids.append((nk, rid))
+                except ValueError:
+                    pass
+
+            if nk.name and any(c.isalpha() for c in nk.name):
+                if nk.name not in {"ROOT", "RXACT"} and len(nk.name) < 64:
+                    found_probable_users.append(nk)
+
+        print("\n[+] Exact target names found")
+        if found_exact:
+            for nk in found_exact:
+                print(
+                    f"    name={nk.name} rel=0x{nk.rel_off:08X} "
+                    f"parent=0x{nk.parent_rel:08X} subkeys={nk.subkey_count} values={nk.value_count}"
+                )
         else:
-            print("\n[-] Users\\Names key not found")
+            print("    None")
 
-        print("\n[*] RID key values (F/V)")
-        for rk in sorted(rid_keys, key=lambda x: x["name"]):
-            rid_hex = rk["name"]
-            rid_dec = int(rid_hex, 16)
+        print("\n[+] RID-style keys found")
+        if found_rids:
+            for nk, rid in found_rids:
+                print(
+                    f"    name={nk.name} RID={rid} rel=0x{nk.rel_off:08X} "
+                    f"parent=0x{nk.parent_rel:08X} values={nk.value_count}"
+                )
+        else:
+            print("    None")
 
-            vals = self.get_values(rk)
-            f_val = None
-            v_val = None
-            for v in vals:
-                if v["name"] == "F":
-                    f_val = v
-                elif v["name"] == "V":
-                    v_val = v
+        print("\n[+] Likely user/group names")
+        seen = set()
+        count = 0
+        for nk in found_probable_users:
+            if nk.name in seen:
+                continue
+            seen.add(nk.name)
+            print(f"    {nk.name}")
+            count += 1
+            if count >= 80:
+                break
 
-            print(f"\nRID key {rid_hex} (decimal {rid_dec})")
-            print(f"    NK offset     : 0x{rk['abs_off']:08X}")
-            print(f"    Last write    : {rk['last_write']}")
-            if f_val:
-                print(f"    F VK offset   : 0x{f_val['abs_off']:08X}")
-                print(f"    F data offset : {('inline' if f_val['inline'] else f'0x{f_val['data_abs']:08X}') if f_val['data'] is not None or f_val['data_abs'] is not None else 'N/A'}")
-                print(f"    F data len    : {f_val['data_len']}")
-                print(f"    F first bytes : {safe_hex(f_val['data'], 32)}")
-            else:
-                print("    F value       : not found")
-
-            if v_val:
-                print(f"    V VK offset   : 0x{v_val['abs_off']:08X}")
-                print(f"    V data offset : {('inline' if v_val['inline'] else f'0x{v_val['data_abs']:08X}') if v_val['data'] is not None or v_val['data_abs'] is not None else 'N/A'}")
-                print(f"    V data len    : {v_val['data_len']}")
-                print(f"    V first bytes : {safe_hex(v_val['data'], 64)}")
-            else:
-                print("    V value       : not found")
-
-    def scan_for_magic(self):
-        print("\n[*] Quick signature scan")
-        for sig in (b"regf", b"hbin", b"nk", b"vk"):
-            found = []
-            start = 0
-            while True:
-                idx = self.data.find(sig, start)
-                if idx == -1:
-                    break
-                found.append(idx)
-                start = idx + 1
-                if len(found) >= 10:
-                    break
-
-            hex_list = ", ".join(f"0x{x:08X}" for x in found) if found else "none"
-            print(f"    {sig!r}: {hex_list}")
+    def run(self):
+        self.parse_header()
+        self.parse_hbins()
+        self.scan_nks()
+        self.show_sample_names()
+        self.search_interesting()
+        self.show_structure_hits()
+        self.extract_user_accounts()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Manual SAM hive parser")
-    ap.add_argument("hive", help="Path to SAM hive file")
-    args = ap.parse_args()
-
-    hive = RegistryHive(args.hive)
-
-    try:
-        hive.parse_header()
-        hive.print_hbins()
-        hive.scan_for_magic()
-        hive.list_users()
-    except Exception as e:
-        print(f"[!] Error: {e}")
+    if len(sys.argv) != 2:
+        print("Usage: py sam_parser.py SAM_copy")
         sys.exit(1)
+
+    parser = SAMParser(sys.argv[1])
+    parser.run()
 
 
 if __name__ == "__main__":
