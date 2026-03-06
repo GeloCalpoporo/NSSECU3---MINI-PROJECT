@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""
-Full SAM Hive Parser (Auto‑Mapping + CSV Export)
+# -*- coding: utf-8 -*-
+r"""
+SAM Hive Parser – Final Reliable Version
 NSSECU3 Mini Project 3
 Author: Your Name
 Date: March 2026
 
+Implements:
 - Registry header parsing
 - HBIN enumeration
-- NK, VK, subkey list parsing
-- Recursive tree traversal
-- Automatic extraction of user account data (F and V values) using pattern search
-- When auto‑parsing fails, prints a hex dump and saves it as a CSV file ready for Excel.
+- NK record parsing with sanity checks
+- Subkey list parsing (lf, lh, li, ri)
+- VK record parsing with strict validation
+- Fallback scanning for VK records when value list is suspicious
+- Recursive tree traversal from root
+- Automatic extraction of user account data (F and V values)
+- Authoritative username source: SAM\Domains\Account\Users\Names
+- Hex dump output for manual Excel mapping
+- CSV export of parsed user data (including hash candidates)
 """
 
 import sys
 import struct
-import os
+import csv
 from datetime import datetime, timedelta
 
 # ----------------------------------------------------------------------
@@ -29,6 +36,7 @@ LIST_MAGICS = {b'lf', b'lh', b'li', b'ri'}
 
 FIRST_HBIN_ABS = 0x1000
 
+# Registry value types (for display only)
 REG_TYPES = {
     0: "REG_NONE", 1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY",
     4: "REG_DWORD", 5: "REG_DWORD_BIG_ENDIAN", 6: "REG_LINK",
@@ -84,6 +92,7 @@ def rel_to_abs(rel_off):
     return FIRST_HBIN_ABS + rel_off
 
 def hex_dump(data, label="", start=0, length=None):
+    """Print a classic hex dump with ASCII column for manual Excel mapping."""
     if length is None:
         length = len(data)
     print(f"\n{label} (offset 0x{start:04x}):")
@@ -94,37 +103,34 @@ def hex_dump(data, label="", start=0, length=None):
         ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
         print(f"{start+i:04x}    {hex_part:<47} {ascii_part}")
 
-# ----------------------------------------------------------------------
-# CSV export for hex dump
-# ----------------------------------------------------------------------
-def save_hex_dump_csv(data, filename):
-    """
-    Write the hex dump of 'data' to a CSV file.
-    The CSV has a header row with offsets (00..0F) and one row per 16 bytes.
-    """
-    try:
-        with open(filename, 'w', newline='') as f:
-            # Write header
-            f.write("Offset," + ",".join(f"{i:02X}" for i in range(16)) + "\n")
-            # Write data rows
-            for i in range(0, len(data), 16):
-                chunk = data[i:i+16]
-                # Offset column
-                line = f"{i:04X},"
-                # Byte columns
-                line += ",".join(f"{b:02x}" for b in chunk)
-                # Pad if last row is short
-                if len(chunk) < 16:
-                    line += "," * (16 - len(chunk))
-                f.write(line + "\n")
-        print(f"        [CSV saved to {filename}]")
-    except Exception as e:
-        print(f"        [Error writing CSV: {e}]")
+def entropyish(blob):
+    """Simple heuristic: number of unique bytes."""
+    return len(set(blob))
 
 # ----------------------------------------------------------------------
-# Automatic parsing functions (heuristic)
+# Automatic parsing functions
 # ----------------------------------------------------------------------
-def auto_find_utf16_string(data, min_len=3, max_len=30):
+def auto_find_utf16_string(data, target=None, min_len=3, max_len=64):
+    """
+    Find a UTF‑16LE string in data.
+    If target is provided, search for its exact UTF‑16LE representation.
+    Otherwise, return the first plausible string.
+    Returns (start_offset, length_in_chars, string) or (None,0,None).
+    """
+    if target:
+        # Try with null terminator
+        target_bytes = target.encode("utf-16le") + b"\x00\x00"
+        pos = data.find(target_bytes)
+        if pos != -1:
+            return pos, len(target), target
+        # Try without null terminator
+        target_bytes = target.encode("utf-16le")
+        pos = data.find(target_bytes)
+        if pos != -1:
+            return pos, len(target), target
+        return None, 0, None
+
+    # Fallback: find first plausible string
     for i in range(0, len(data) - 2, 2):
         if data[i+1] == 0x00 and 0x20 <= data[i] <= 0x7E:
             j = i
@@ -132,60 +138,98 @@ def auto_find_utf16_string(data, min_len=3, max_len=30):
                 j += 2
             length = (j - i) // 2
             if min_len <= length <= max_len:
-                return i, length
-    return None, 0
+                s = data[i:j+2].decode("utf-16le", errors="ignore").rstrip("\x00")
+                return i, length, s
+    return None, 0, None
 
-def auto_find_hash_blocks(data, start_after):
-    for i in range(start_after, len(data) - 32):
-        b1 = data[i:i+16]
-        b2 = data[i+16:i+32]
-        if (all(b != 0 for b in b1) and all(b != 0 for b in b2) and
-            not all(0x20 <= b <= 0x7E for b in b1) and
-            not all(0x20 <= b <= 0x7E for b in b2)):
-            return i
-    return None
+def auto_parse_v(v_data, expected_username=None):
+    """
+    Extract username and high‑entropy 16‑byte blocks (hash candidates) from V data.
+    - Username: if expected_username provided, search for that exact string.
+               Otherwise, find the first plausible string.
+    - Hash candidates: scan the entire V data for 16‑byte blocks with high entropy
+                       (non‑zero, not all printable ASCII, at least 8 unique bytes).
+    Returns a dict with keys: username, username_offset, lm_blob, nt_blob.
+    """
+    result = {
+        "username": "",
+        "username_offset": None,
+        "lm_blob": b"",
+        "nt_blob": b"",
+    }
 
-def auto_parse_v(v_data):
-    result = {"username": "", "lm_blob": b"", "nt_blob": b"", "offsets": {}}
-    name_off, name_len = auto_find_utf16_string(v_data)
-    if name_off is None:
-        return None
-    result["username"] = v_data[name_off:name_off+name_len*2].decode("utf-16le", errors="ignore")
-    result["offsets"]["name"] = name_off
-    hash_off = auto_find_hash_blocks(v_data, name_off + name_len*2)
-    if hash_off:
-        result["lm_blob"] = v_data[hash_off:hash_off+16]
-        result["nt_blob"] = v_data[hash_off+16:hash_off+32]
-        result["offsets"]["hash"] = hash_off
+    # ---- Find username ----
+    if expected_username:
+        off, _, found = auto_find_utf16_string(v_data, target=expected_username)
+        if off is not None:
+            result["username"] = found
+            result["username_offset"] = off
+    if not result["username"]:
+        off, _, s = auto_find_utf16_string(v_data)
+        if off is None:
+            return None
+        result["username"] = s
+        result["username_offset"] = off
+
+    # ---- Scan for hash blocks ----
+    username_end = result["username_offset"] + len(result["username"]) * 2
+    hash_candidates = []
+
+    # Slide a 16‑byte window across the whole V data
+    for i in range(0, len(v_data) - 15):
+        # Skip if this window overlaps the username region
+        if i < username_end and i + 16 > result["username_offset"]:
+            continue
+        block = v_data[i:i+16]
+        # Heuristic for a non‑trivial, non‑ASCII block
+        if (all(b != 0 for b in block) and
+            not all(0x20 <= b <= 0x7E for b in block) and
+            entropyish(block) >= 8):
+            hash_candidates.append((i, block))
+
+    if hash_candidates:
+        # Sort by offset and take first two as LM and NT candidates
+        hash_candidates.sort()
+        result["lm_blob"] = hash_candidates[0][1]
+        if len(hash_candidates) > 1:
+            result["nt_blob"] = hash_candidates[1][1]
+
     return result
 
-def auto_find_rid(f_data, expected_rid):
+def auto_parse_f_improved(f_data, expected_rid):
+    """
+    Parse the F value using known structure of USER_ACCOUNT.
+    Returns a dict with account flags, timestamps, etc.
+    """
     rid_bytes = struct.pack("<I", expected_rid)
+    rid_off = None
     for off in range(len(f_data) - 3):
         if f_data[off:off+4] == rid_bytes:
-            return off
-    return None
+            rid_off = off
+            break
+    if rid_off is None or rid_off < 0x30:
+        return None
 
-def auto_parse_f(f_data, expected_rid):
-    rid_off = auto_find_rid(f_data, expected_rid)
-    if rid_off is None:
-        return None
-    off_flags = rid_off + 8
-    off_last_logon = rid_off + 0x10
-    off_last_pwd = rid_off + 0x18
-    off_expires = rid_off + 0x20
-    off_last_failed = rid_off + 0x28
-    off_failed_cnt = rid_off + 0x30
-    off_logon_cnt = rid_off + 0x38
-    if off_logon_cnt + 4 > len(f_data):
-        return None
-    account_flags = u32(f_data, off_flags) if off_flags+4 <= len(f_data) else 0
-    last_logon = u64(f_data, off_last_logon) if off_last_logon+8 <= len(f_data) else 0
-    last_pwd_set = u64(f_data, off_last_pwd) if off_last_pwd+8 <= len(f_data) else 0
-    account_expires = u64(f_data, off_expires) if off_expires+8 <= len(f_data) else 0
-    last_failed_logon = u64(f_data, off_last_failed) if off_last_failed+8 <= len(f_data) else 0
-    failed_logon_count = u32(f_data, off_failed_cnt) if off_failed_cnt+4 <= len(f_data) else 0
-    logon_count = u32(f_data, off_logon_cnt) if off_logon_cnt+4 <= len(f_data) else 0
+    struct_start = rid_off - 0x30  # approximate start of USER_ACCOUNT
+
+    def get_dword(off):
+        if struct_start + off + 4 <= len(f_data):
+            return u32(f_data, struct_start + off)
+        return 0
+    def get_qword(off):
+        if struct_start + off + 8 <= len(f_data):
+            return u64(f_data, struct_start + off)
+        return 0
+
+    last_logon = get_qword(0x08)
+    last_pwd_set = get_qword(0x10)
+    account_expires = get_qword(0x18)
+    last_failed_logon = get_qword(0x20)
+    failed_logon_count = get_dword(0x28)
+    logon_count = get_dword(0x2C)
+    rid = get_dword(0x30)
+    account_flags = get_dword(0x38)
+
     flags_list = []
     if account_flags & UF_ACCOUNT_DISABLE:   flags_list.append("DISABLED")
     if account_flags & UF_LOCKOUT:           flags_list.append("LOCKED_OUT")
@@ -193,8 +237,9 @@ def auto_parse_f(f_data, expected_rid):
     if account_flags & UF_NORMAL_ACCOUNT:    flags_list.append("NORMAL_ACCOUNT")
     if account_flags & UF_DONT_EXPIRE_PASSWD: flags_list.append("PASSWORD_NEVER_EXPIRES")
     if account_flags & UF_PASSWORD_EXPIRED:  flags_list.append("PASSWORD_EXPIRED")
+
     return {
-        "rid": expected_rid,
+        "rid": rid,
         "account_flags": account_flags,
         "flags_readable": ", ".join(flags_list) if flags_list else "None",
         "last_logon": filetime_to_str(last_logon),
@@ -203,11 +248,17 @@ def auto_parse_f(f_data, expected_rid):
         "last_failed_logon": filetime_to_str(last_failed_logon),
         "failed_logon_count": failed_logon_count,
         "logon_count": logon_count,
-        "offsets": {"rid": rid_off, "flags": off_flags}
+        "offsets": {
+            "struct_start": struct_start,
+            "rid": rid_off,
+            "flags": struct_start + 0x38,
+            "last_logon": struct_start + 0x08,
+            "last_pwd_set": struct_start + 0x10,
+        }
     }
 
 # ----------------------------------------------------------------------
-# Data structures (unchanged)
+# Data structures
 # ----------------------------------------------------------------------
 class NKRecord:
     def __init__(self, abs_off, rel_off, parent_rel, name, flags,
@@ -247,7 +298,7 @@ class SAMParser:
         self.root_abs = None
 
     # ------------------------------------------------------------------
-    # Header and HBIN enumeration (unchanged)
+    # Header and HBIN enumeration
     # ------------------------------------------------------------------
     def parse_header(self):
         if self.data[0:4] != REGF_MAGIC:
@@ -289,7 +340,7 @@ class SAMParser:
             print(f"    HBIN[{i}] abs=0x{abs_off:08X} rel=0x{rel:08X} size=0x{size:08X}")
 
     # ------------------------------------------------------------------
-    # NK record parsing (unchanged)
+    # NK record parsing
     # ------------------------------------------------------------------
     def try_parse_nk(self, cell_abs):
         try:
@@ -353,7 +404,7 @@ class SAMParser:
         print(f"[*] Total NK records found: {len(self.nk_by_abs)}")
 
     # ------------------------------------------------------------------
-    # Subkey list parsing (unchanged)
+    # Subkey list parsing
     # ------------------------------------------------------------------
     def parse_subkey_list(self, offset_rel, count):
         offset_abs = rel_to_abs(offset_rel)
@@ -394,7 +445,7 @@ class SAMParser:
         return entries
 
     # ------------------------------------------------------------------
-    # Tree traversal (unchanged)
+    # Tree traversal
     # ------------------------------------------------------------------
     def get_key_path(self, nk):
         parts = []
@@ -441,7 +492,7 @@ class SAMParser:
         return current_nk
 
     # ------------------------------------------------------------------
-    # VK record parsing (unchanged)
+    # VK record parsing with strict validation
     # ------------------------------------------------------------------
     def parse_vk(self, vk_abs):
         try:
@@ -451,6 +502,8 @@ class SAMParser:
             if self.data[vk_abs + 4:vk_abs + 6] != VK_MAGIC:
                 return None
             name_len = u16(self.data, vk_abs + 0x06)
+            if name_len > 512:
+                return None
             data_len_raw = u32(self.data, vk_abs + 0x08)
             data_rel = u32(self.data, vk_abs + 0x0C)
             value_type = u32(self.data, vk_abs + 0x10)
@@ -477,6 +530,8 @@ class SAMParser:
                 data_abs = rel_to_abs(data_rel)
                 if data_abs is not None and data_len > 0 and data_abs + data_len <= len(self.data):
                     data = self.data[data_abs:data_abs + data_len]
+                else:
+                    data = b""
 
             rel_off = vk_abs - FIRST_HBIN_ABS
             return VKRecord(
@@ -492,13 +547,37 @@ class SAMParser:
         except Exception:
             return None
 
+    def scan_vk_near_nk(self, nk, max_bytes=0x200):
+        """Scan for VK records starting just after the NK cell."""
+        vks = []
+        cell_size = abs(i32(self.data, nk.abs_off))
+        start = nk.abs_off + cell_size
+        end = min(start + max_bytes, len(self.data))
+        pos = start
+        while pos + 8 < end:
+            cell_sz = i32(self.data, pos)
+            if cell_sz == 0:
+                break
+            if cell_sz < 0 and self.data[pos+4:pos+6] == VK_MAGIC:
+                vk = self.parse_vk(pos)
+                if vk:
+                    vks.append(vk)
+            pos += abs(cell_sz)
+        return vks
+
     def get_vk_list(self, nk):
         vks = []
+        if nk.value_count > 20 or nk.value_count == 4294967295:
+            print(f"    [!] Suspicious value_count={nk.value_count}, scanning nearby...")
+            return self.scan_vk_near_nk(nk)
+
         if nk.value_count == 0 or nk.value_list_rel in (0, 0xFFFFFFFF):
             return vks
+
         list_abs = rel_to_abs(nk.value_list_rel)
         if list_abs is None:
             return vks
+
         for i in range(nk.value_count):
             off_pos = list_abs + i * 4
             if off_pos + 4 > len(self.data):
@@ -515,12 +594,34 @@ class SAMParser:
         return vks
 
     # ------------------------------------------------------------------
-    # Main user extraction (modified to save CSV when hex dump is printed)
+    # Map RID to username from Names subkey (authoritative)
+    # ------------------------------------------------------------------
+    def map_rid_to_username(self):
+        r"""Return dict {rid: username} from SAM\Domains\Account\Users\Names."""
+        mapping = {}
+        names_nk = self.find_key_by_path("ROOT\\SAM\\Domains\\Account\\Users\\Names")
+        if not names_nk:
+            return mapping
+        name_offsets = self.parse_subkey_list(names_nk.subkey_list_rel, names_nk.subkey_count)
+        for off in name_offsets:
+            name_nk = self.nk_by_abs.get(off)
+            if not name_nk:
+                continue
+            # The default value contains the RID (binary DWORD)
+            vks = self.get_vk_list(name_nk)
+            for vk in vks:
+                if vk.name == "" and vk.value_type == 3 and vk.data_len == 4:
+                    rid = u32(vk.data, 0)
+                    mapping[rid] = name_nk.name
+                    break
+        return mapping
+
+    # ------------------------------------------------------------------
+    # User extraction (main)
     # ------------------------------------------------------------------
     def extract_users(self):
         print("\n[*] Extracting user account data from SAM\\Domains\\Account\\Users")
-        target_path = "ROOT\\SAM\\Domains\\Account\\Users"
-        users_nk = self.find_key_by_path(target_path)
+        users_nk = self.find_key_by_path("ROOT\\SAM\\Domains\\Account\\Users")
         if not users_nk:
             print("[-] Users key not found.")
             return
@@ -529,20 +630,15 @@ class SAMParser:
         child_offsets = self.parse_subkey_list(users_nk.subkey_list_rel, users_nk.subkey_count)
         print(f"[+] Found {len(child_offsets)} subkeys under Users")
 
-        names_nk = self.find_key_by_path("ROOT\\SAM\\Domains\\Account\\Users\\Names")
-        if names_nk:
-            print("\n[*] Usernames found under Names:")
-            name_offsets = self.parse_subkey_list(names_nk.subkey_list_rel, names_nk.subkey_count)
-            for off in name_offsets:
-                name_nk = self.nk_by_abs.get(off)
-                if name_nk:
-                    ts = filetime_to_str(name_nk.timestamp)
-                    print(f"    {name_nk.name}  rel=0x{name_nk.rel_off:08X}  timestamp={ts}")
+        # Build RID->username map from Names subkey (authoritative)
+        rid_to_name = self.map_rid_to_username()
+        if rid_to_name:
+            print("[+] Authoritative username mapping from Names subkey:")
+            for rid, name in sorted(rid_to_name.items()):
+                print(f"    RID {rid} -> {name}")
 
-        # Create a directory for CSV dumps
-        csv_dir = "hex_dumps"
-        if not os.path.exists(csv_dir):
-            os.makedirs(csv_dir)
+        # Collect results for CSV export
+        results = []
 
         for child_abs in child_offsets:
             nk = self.nk_by_abs.get(child_abs)
@@ -562,7 +658,7 @@ class SAMParser:
             print(f"    Values    : {len(vks)}")
 
             if not vks:
-                print("    [!] No VK records parsed safely from this RID key")
+                print("    [!] No VK records found for this RID key")
                 continue
 
             f_vk = v_vk = None
@@ -574,35 +670,73 @@ class SAMParser:
                 elif vk.name == "V":
                     v_vk = vk
 
-            # ----- F value parsing -----
-            if f_vk:
-                print(f"      F bytes (first 32): {f_vk.data[:32].hex()}")
-                f_info = auto_parse_f(f_vk.data, rid)
-                if f_info:
-                    print(f"        [Auto] Found RID at offset 0x{f_info['offsets']['rid']:X}")
-                    self._print_f_info(f_info)
-                else:
-                    print("        Could not parse F value automatically.")
-                    # Print hex dump and save CSV
-                    hex_dump(f_vk.data, f"F value for {nk.name}")
-                    csv_filename = os.path.join(csv_dir, f"F_value_RID_{rid}.csv")
-                    save_hex_dump_csv(f_vk.data, csv_filename)
+            # Prepare user record (username from Names)
+            username = rid_to_name.get(rid, "")
+            user_rec = {
+                "rid": rid,
+                "username": username,          # authoritative
+                "account_flags": "",
+                "last_logon": "",
+                "last_pwd_set": "",
+                "account_expires": "",
+                "last_failed_logon": "",
+                "failed_logon_count": "",
+                "logon_count": "",
+                "lm_blob": "",
+                "nt_blob": "",
+                "v_username": "",               # from V (for verification)
+                "v_match": False
+            }
 
-            # ----- V value parsing -----
-            if v_vk:
-                print(f"      V bytes (first 32): {v_vk.data[:32].hex()}")
-                v_info = auto_parse_v(v_vk.data)
-                if v_info and v_info['username']:
-                    print(f"        [Auto] Found username at offset 0x{v_info['offsets']['name']:X}")
-                    if 'hash' in v_info['offsets']:
-                        print(f"                hashes at offset 0x{v_info['offsets']['hash']:X}")
-                    self._print_v_info(v_info)
+            # ----- F value -----
+            if f_vk:
+                hex_dump(f_vk.data, f"F value for {nk.name} (RID {rid})", f_vk.data_rel)
+                f_info = auto_parse_f_improved(f_vk.data, rid)
+                if f_info:
+                    self._print_f_info(f_info)
+                    user_rec.update({
+                        "account_flags": f_info['flags_readable'],
+                        "last_logon": f_info['last_logon'],
+                        "last_pwd_set": f_info['last_pwd_set'],
+                        "account_expires": f_info['account_expires'],
+                        "last_failed_logon": f_info['last_failed_logon'],
+                        "failed_logon_count": f_info['failed_logon_count'],
+                        "logon_count": f_info['logon_count'],
+                    })
                 else:
-                    print("        Could not parse V value automatically.")
-                    # Print hex dump and save CSV
-                    hex_dump(v_vk.data, f"V value for {nk.name}")
-                    csv_filename = os.path.join(csv_dir, f"V_value_RID_{rid}.csv")
-                    save_hex_dump_csv(v_vk.data, csv_filename)
+                    print("    Could not parse F value automatically. Use the hex dump above for manual mapping.")
+
+            # ----- V value -----
+            if v_vk:
+                hex_dump(v_vk.data, f"V value for {nk.name} (RID {rid})", v_vk.data_rel)
+                v_info = auto_parse_v(v_vk.data, expected_username=username if username else None)
+                if v_info and v_info['username']:
+                    print(f"        [Auto] Found username at offset 0x{v_info['username_offset']:X}")
+                    self._print_v_info(v_info)
+                    user_rec.update({
+                        "v_username": v_info['username'],
+                        "v_match": (v_info['username'] == username),
+                        "lm_blob": v_info.get('lm_blob', b'').hex(),
+                        "nt_blob": v_info.get('nt_blob', b'').hex(),
+                    })
+                    if username and v_info['username'] != username:
+                        print(f"        [!] Username mismatch: V says '{v_info['username']}', Names says '{username}'")
+                else:
+                    print("        Could not parse V value automatically. Use the hex dump above for manual mapping.")
+
+            results.append(user_rec)
+
+        # Write CSV
+        if results:
+            csv_path = "sam_users.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                fieldnames = ["rid", "username", "account_flags", "last_logon", "last_pwd_set",
+                              "account_expires", "last_failed_logon", "failed_logon_count",
+                              "logon_count", "lm_blob", "nt_blob", "v_username", "v_match"]
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(results)
+            print(f"\n[+] CSV summary saved to {csv_path}")
 
     def _print_f_info(self, f_info):
         print(f"        RID in F           : {f_info['rid']}")
@@ -618,11 +752,13 @@ class SAMParser:
         print(f"        Username  : {v_info['username']}")
         lm = v_info.get('lm_blob', b'')
         nt = v_info.get('nt_blob', b'')
-        print(f"        LM blob   : {lm.hex()}")
-        print(f"        NT blob   : {nt.hex()}")
+        if lm:
+            print(f"        LM blob   : {lm.hex()} (raw 16‑byte candidate; may be encrypted)")
+        if nt:
+            print(f"        NT blob   : {nt.hex()} (raw 16‑byte candidate; may be encrypted)")
 
     # ------------------------------------------------------------------
-    # Search for interesting keys (optional, unchanged)
+    # Search for interesting keys (optional)
     # ------------------------------------------------------------------
     def search_interesting(self):
         print("\n[*] Searching for interesting names directly")

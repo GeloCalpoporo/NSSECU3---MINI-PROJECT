@@ -1,0 +1,5 @@
+rid,username,account_flags,last_logon,last_pwd_set,account_expires,last_failed_logon,failed_logon_count,logon_count,lm_blob,nt_blob,v_username,v_match
+500,,"LOCKED_OUT, NORMAL_ACCOUNT",N/A,N/A,N/A,N/A,0,0,dea22867213ed2af19ad5d79b0c10729,a22867213ed2af19ad5d79b0c1072927,Administratorज,False
+501,,"LOCKED_OUT, NORMAL_ACCOUNT",N/A,N/A,N/A,N/A,0,0,dea22867213ed2af19ad5d79b0c10729,a22867213ed2af19ad5d79b0c1072927,Guest,False
+503,,"LOCKED_OUT, NORMAL_ACCOUNT",N/A,N/A,N/A,N/A,0,0,dea22867213ed2af19ad5d79b0c10729,a22867213ed2af19ad5d79b0c1072927,DefaultAccountA user account managed by the system.iȁ,False
+1000,,,,,,,,,,,,False
