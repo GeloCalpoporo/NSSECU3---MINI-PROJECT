@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-Full SAM Hive Parser
+Full SAM Hive Parser (Auto‑Mapping + CSV Export)
 NSSECU3 Mini Project 3
 Author: Your Name
 Date: March 2026
 
-Implements:
 - Registry header parsing
 - HBIN enumeration
-- NK record parsing (full structure)
-- Subkey list parsing (lf, lh, li, ri)
-- VK record parsing (value cells)
-- Recursive tree traversal from root
-- Extraction of user account data (F and V values)
-- Detailed F value interpretation (flags, timestamps)
-- Hex dump utility for manual Excel mapping
+- NK, VK, subkey list parsing
+- Recursive tree traversal
+- Automatic extraction of user account data (F and V values) using pattern search
+- When auto‑parsing fails, prints a hex dump and saves it as a CSV file ready for Excel.
 """
 
 import sys
 import struct
+import os
 from datetime import datetime, timedelta
 
 # ----------------------------------------------------------------------
@@ -32,20 +29,11 @@ LIST_MAGICS = {b'lf', b'lh', b'li', b'ri'}
 
 FIRST_HBIN_ABS = 0x1000
 
-# Registry value types
 REG_TYPES = {
-    0: "REG_NONE",
-    1: "REG_SZ",
-    2: "REG_EXPAND_SZ",
-    3: "REG_BINARY",
-    4: "REG_DWORD",
-    5: "REG_DWORD_BIG_ENDIAN",
-    6: "REG_LINK",
-    7: "REG_MULTI_SZ",
-    8: "REG_RESOURCE_LIST",
-    9: "REG_FULL_RESOURCE_DESCRIPTOR",
-    10: "REG_RESOURCE_REQUIREMENTS_LIST",
-    11: "REG_QWORD",
+    0: "REG_NONE", 1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY",
+    4: "REG_DWORD", 5: "REG_DWORD_BIG_ENDIAN", 6: "REG_LINK",
+    7: "REG_MULTI_SZ", 8: "REG_RESOURCE_LIST", 9: "REG_FULL_RESOURCE_DESCRIPTOR",
+    10: "REG_RESOURCE_REQUIREMENTS_LIST", 11: "REG_QWORD",
 }
 
 # Account flags (from Windows SDK)
@@ -53,41 +41,20 @@ UF_ACCOUNT_DISABLE = 0x00000002
 UF_LOCKOUT = 0x00000010
 UF_PASSWD_NOTREQD = 0x00000020
 UF_PASSWD_CANT_CHANGE = 0x00000040
-UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED = 0x00000080
 UF_NORMAL_ACCOUNT = 0x00000200
-UF_INTERDOMAIN_TRUST_ACCOUNT = 0x00000800
-UF_WORKSTATION_TRUST_ACCOUNT = 0x00001000
-UF_SERVER_TRUST_ACCOUNT = 0x00002000
 UF_DONT_EXPIRE_PASSWD = 0x00010000
-UF_MNS_LOGON_ACCOUNT = 0x00020000
-UF_SMARTCARD_REQUIRED = 0x00040000
-UF_TRUSTED_FOR_DELEGATION = 0x00080000
-UF_NOT_DELEGATED = 0x00100000
-UF_USE_DES_KEY_ONLY = 0x00200000
-UF_DONT_REQUIRE_PREAUTH = 0x00400000
 UF_PASSWORD_EXPIRED = 0x00800000
-UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION = 0x01000000
-UF_NO_AUTH_DATA_REQUIRED = 0x02000000
-UF_PARTIAL_SECRETS_ACCOUNT = 0x04000000
 
 # ----------------------------------------------------------------------
 # Helper functions
 # ----------------------------------------------------------------------
-def u16(data, off):
-    return struct.unpack_from("<H", data, off)[0]
-
-def u32(data, off):
-    return struct.unpack_from("<I", data, off)[0]
-
-def i32(data, off):
-    return struct.unpack_from("<i", data, off)[0]
-
-def u64(data, off):
-    return struct.unpack_from("<Q", data, off)[0]
+def u16(data, off): return struct.unpack_from("<H", data, off)[0]
+def u32(data, off): return struct.unpack_from("<I", data, off)[0]
+def i32(data, off): return struct.unpack_from("<i", data, off)[0]
+def u64(data, off): return struct.unpack_from("<Q", data, off)[0]
 
 def filetime_to_str(ft):
-    """Convert Windows FILETIME (100‑ns intervals since 1601‑01‑01) to readable string."""
-    if ft == 0 or ft == 0x7FFFFFFFFFFFFFFF:  # 0 or max means never / not set
+    if ft == 0 or ft == 0x7FFFFFFFFFFFFFFF:
         return "N/A"
     try:
         dt = datetime(1601, 1, 1) + timedelta(microseconds=ft / 10)
@@ -99,7 +66,6 @@ def is_printable_ascii(bs):
     return bool(bs) and all(0x20 <= b <= 0x7E for b in bs)
 
 def decode_name(raw):
-    """Decode a key name (may be ASCII or UTF‑16LE)."""
     if not raw:
         return ""
     if is_printable_ascii(raw):
@@ -113,13 +79,11 @@ def decode_name(raw):
     return raw.decode("ascii", errors="ignore").rstrip("\x00")
 
 def rel_to_abs(rel_off):
-    """Convert a relative offset (from first HBIN) to absolute file offset."""
     if rel_off == 0xFFFFFFFF or rel_off == 0:
         return None
     return FIRST_HBIN_ABS + rel_off
 
 def hex_dump(data, label="", start=0, length=None):
-    """Print a hex dump of data in 16‑byte rows (ready for Excel mapping)."""
     if length is None:
         length = len(data)
     print(f"\n{label} (offset 0x{start:04x}):")
@@ -131,7 +95,119 @@ def hex_dump(data, label="", start=0, length=None):
         print(f"{start+i:04x}    {hex_part:<47} {ascii_part}")
 
 # ----------------------------------------------------------------------
-# Data structures
+# CSV export for hex dump
+# ----------------------------------------------------------------------
+def save_hex_dump_csv(data, filename):
+    """
+    Write the hex dump of 'data' to a CSV file.
+    The CSV has a header row with offsets (00..0F) and one row per 16 bytes.
+    """
+    try:
+        with open(filename, 'w', newline='') as f:
+            # Write header
+            f.write("Offset," + ",".join(f"{i:02X}" for i in range(16)) + "\n")
+            # Write data rows
+            for i in range(0, len(data), 16):
+                chunk = data[i:i+16]
+                # Offset column
+                line = f"{i:04X},"
+                # Byte columns
+                line += ",".join(f"{b:02x}" for b in chunk)
+                # Pad if last row is short
+                if len(chunk) < 16:
+                    line += "," * (16 - len(chunk))
+                f.write(line + "\n")
+        print(f"        [CSV saved to {filename}]")
+    except Exception as e:
+        print(f"        [Error writing CSV: {e}]")
+
+# ----------------------------------------------------------------------
+# Automatic parsing functions (heuristic)
+# ----------------------------------------------------------------------
+def auto_find_utf16_string(data, min_len=3, max_len=30):
+    for i in range(0, len(data) - 2, 2):
+        if data[i+1] == 0x00 and 0x20 <= data[i] <= 0x7E:
+            j = i
+            while j+1 < len(data) and data[j+1] == 0x00 and 0x20 <= data[j] <= 0x7E:
+                j += 2
+            length = (j - i) // 2
+            if min_len <= length <= max_len:
+                return i, length
+    return None, 0
+
+def auto_find_hash_blocks(data, start_after):
+    for i in range(start_after, len(data) - 32):
+        b1 = data[i:i+16]
+        b2 = data[i+16:i+32]
+        if (all(b != 0 for b in b1) and all(b != 0 for b in b2) and
+            not all(0x20 <= b <= 0x7E for b in b1) and
+            not all(0x20 <= b <= 0x7E for b in b2)):
+            return i
+    return None
+
+def auto_parse_v(v_data):
+    result = {"username": "", "lm_blob": b"", "nt_blob": b"", "offsets": {}}
+    name_off, name_len = auto_find_utf16_string(v_data)
+    if name_off is None:
+        return None
+    result["username"] = v_data[name_off:name_off+name_len*2].decode("utf-16le", errors="ignore")
+    result["offsets"]["name"] = name_off
+    hash_off = auto_find_hash_blocks(v_data, name_off + name_len*2)
+    if hash_off:
+        result["lm_blob"] = v_data[hash_off:hash_off+16]
+        result["nt_blob"] = v_data[hash_off+16:hash_off+32]
+        result["offsets"]["hash"] = hash_off
+    return result
+
+def auto_find_rid(f_data, expected_rid):
+    rid_bytes = struct.pack("<I", expected_rid)
+    for off in range(len(f_data) - 3):
+        if f_data[off:off+4] == rid_bytes:
+            return off
+    return None
+
+def auto_parse_f(f_data, expected_rid):
+    rid_off = auto_find_rid(f_data, expected_rid)
+    if rid_off is None:
+        return None
+    off_flags = rid_off + 8
+    off_last_logon = rid_off + 0x10
+    off_last_pwd = rid_off + 0x18
+    off_expires = rid_off + 0x20
+    off_last_failed = rid_off + 0x28
+    off_failed_cnt = rid_off + 0x30
+    off_logon_cnt = rid_off + 0x38
+    if off_logon_cnt + 4 > len(f_data):
+        return None
+    account_flags = u32(f_data, off_flags) if off_flags+4 <= len(f_data) else 0
+    last_logon = u64(f_data, off_last_logon) if off_last_logon+8 <= len(f_data) else 0
+    last_pwd_set = u64(f_data, off_last_pwd) if off_last_pwd+8 <= len(f_data) else 0
+    account_expires = u64(f_data, off_expires) if off_expires+8 <= len(f_data) else 0
+    last_failed_logon = u64(f_data, off_last_failed) if off_last_failed+8 <= len(f_data) else 0
+    failed_logon_count = u32(f_data, off_failed_cnt) if off_failed_cnt+4 <= len(f_data) else 0
+    logon_count = u32(f_data, off_logon_cnt) if off_logon_cnt+4 <= len(f_data) else 0
+    flags_list = []
+    if account_flags & UF_ACCOUNT_DISABLE:   flags_list.append("DISABLED")
+    if account_flags & UF_LOCKOUT:           flags_list.append("LOCKED_OUT")
+    if account_flags & UF_PASSWD_NOTREQD:    flags_list.append("PASSWORD_NOT_REQUIRED")
+    if account_flags & UF_NORMAL_ACCOUNT:    flags_list.append("NORMAL_ACCOUNT")
+    if account_flags & UF_DONT_EXPIRE_PASSWD: flags_list.append("PASSWORD_NEVER_EXPIRES")
+    if account_flags & UF_PASSWORD_EXPIRED:  flags_list.append("PASSWORD_EXPIRED")
+    return {
+        "rid": expected_rid,
+        "account_flags": account_flags,
+        "flags_readable": ", ".join(flags_list) if flags_list else "None",
+        "last_logon": filetime_to_str(last_logon),
+        "last_pwd_set": filetime_to_str(last_pwd_set),
+        "account_expires": filetime_to_str(account_expires),
+        "last_failed_logon": filetime_to_str(last_failed_logon),
+        "failed_logon_count": failed_logon_count,
+        "logon_count": logon_count,
+        "offsets": {"rid": rid_off, "flags": off_flags}
+    }
+
+# ----------------------------------------------------------------------
+# Data structures (unchanged)
 # ----------------------------------------------------------------------
 class NKRecord:
     def __init__(self, abs_off, rel_off, parent_rel, name, flags,
@@ -167,11 +243,11 @@ class SAMParser:
         with open(path, "rb") as f:
             self.data = f.read()
         self.hbins = []
-        self.nk_by_abs = {}          # absolute offset -> NKRecord
+        self.nk_by_abs = {}
         self.root_abs = None
 
     # ------------------------------------------------------------------
-    # Header and HBIN enumeration
+    # Header and HBIN enumeration (unchanged)
     # ------------------------------------------------------------------
     def parse_header(self):
         if self.data[0:4] != REGF_MAGIC:
@@ -213,7 +289,7 @@ class SAMParser:
             print(f"    HBIN[{i}] abs=0x{abs_off:08X} rel=0x{rel:08X} size=0x{size:08X}")
 
     # ------------------------------------------------------------------
-    # NK record parsing – using offsets that worked earlier
+    # NK record parsing (unchanged)
     # ------------------------------------------------------------------
     def try_parse_nk(self, cell_abs):
         try:
@@ -231,7 +307,6 @@ class SAMParser:
             value_count = u32(self.data, cell_abs + 0x24)
             value_list_rel = u32(self.data, cell_abs + 0x28)
 
-            # Name length and name (starts at 0x50 in your hive)
             name_len = u16(self.data, cell_abs + 0x4C)
             name_start = cell_abs + 0x50
             name_end = name_start + name_len
@@ -239,8 +314,6 @@ class SAMParser:
                 return None
             raw_name = self.data[name_start:name_end]
             name = decode_name(raw_name).strip()
-            if not name:
-                return None
 
             rel_off = cell_abs - FIRST_HBIN_ABS
             return NKRecord(
@@ -280,16 +353,14 @@ class SAMParser:
         print(f"[*] Total NK records found: {len(self.nk_by_abs)}")
 
     # ------------------------------------------------------------------
-    # Subkey list parsing (lf, lh, li, ri)
+    # Subkey list parsing (unchanged)
     # ------------------------------------------------------------------
     def parse_subkey_list(self, offset_rel, count):
-        """Parse a subkey list (lf, lh, li, ri) and return list of NK absolute offsets."""
         offset_abs = rel_to_abs(offset_rel)
         if offset_abs is None or offset_abs + 4 > len(self.data):
             return []
         magic = self.data[offset_abs + 4:offset_abs + 6]
 
-        # If not a standard list, treat as array of offsets (old style)
         if magic not in LIST_MAGICS:
             offsets = []
             for i in range(count):
@@ -301,7 +372,6 @@ class SAMParser:
                     offsets.append(nk_abs)
             return offsets
 
-        # ri = indirect list (list of lists)
         if magic == b'ri':
             num_lists = u32(self.data, offset_abs + 8)
             offsets = []
@@ -310,7 +380,6 @@ class SAMParser:
                 offsets.extend(self.parse_subkey_list(list_rel, 0))
             return offsets
 
-        # lf, lh, li: each entry is 8 bytes (offset + name hint)
         entries = []
         for i in range(count):
             entry_off = offset_abs + 8 + i * 8
@@ -325,49 +394,54 @@ class SAMParser:
         return entries
 
     # ------------------------------------------------------------------
-    # Tree traversal and path reconstruction
+    # Tree traversal (unchanged)
     # ------------------------------------------------------------------
     def get_key_path(self, nk):
-        """Return the full registry path of an NK record using parent pointers."""
         parts = []
         cur = nk
         seen = set()
-        while cur is not None and cur.parent_rel != 0:
+        while cur is not None:
             if cur.rel_off in seen:
                 break
             seen.add(cur.rel_off)
-            parts.append(cur.name)
-            parent_abs = rel_to_abs(cur.parent_rel)
-            cur = self.nk_by_abs.get(parent_abs, None)
-        # Add root if we reached it
-        if cur and cur.name == "ROOT":
-            parts.append("ROOT")
+            if cur.parent_rel == 0 or cur.parent_rel == 0xFFFFFFFF:
+                if cur.abs_off == self.root_abs:
+                    parts.append("ROOT")
+                else:
+                    parts.append(f"[UNKNOWN_ROOT_{cur.rel_off:08X}]")
+                break
+            else:
+                parts.append(cur.name)
+                parent_abs = rel_to_abs(cur.parent_rel)
+                cur = self.nk_by_abs.get(parent_abs, None)
+                if cur is None:
+                    break
         return "\\".join(reversed(parts))
 
     def find_key_by_path(self, path):
-        """Find a key by absolute path (e.g., 'ROOT\\SAM\\Domains\\Account\\Users')."""
         parts = path.split('\\')
         if parts[0] != "ROOT":
             return None
-        current_abs = self.root_abs
+        current_nk = self.nk_by_abs.get(self.root_abs)
+        if not current_nk:
+            return None
         for part in parts[1:]:
-            nk = self.nk_by_abs.get(current_abs)
-            if not nk or nk.subkey_count == 0:
+            if current_nk.subkey_count == 0:
                 return None
-            child_offsets = self.parse_subkey_list(nk.subkey_list_rel, nk.subkey_count)
+            child_offsets = self.parse_subkey_list(current_nk.subkey_list_rel, current_nk.subkey_count)
             found = False
             for child_abs in child_offsets:
                 child = self.nk_by_abs.get(child_abs)
                 if child and child.name == part:
-                    current_abs = child_abs
+                    current_nk = child
                     found = True
                     break
             if not found:
                 return None
-        return self.nk_by_abs.get(current_abs)
+        return current_nk
 
     # ------------------------------------------------------------------
-    # VK record parsing
+    # VK record parsing (unchanged)
     # ------------------------------------------------------------------
     def parse_vk(self, vk_abs):
         try:
@@ -388,7 +462,6 @@ class SAMParser:
                 return None
             raw_name = self.data[name_start:name_end]
 
-            # Decode name (ASCII if flag 0x0001 set)
             if flags & 0x0001:
                 name = raw_name.decode("ascii", errors="ignore").rstrip("\x00")
             else:
@@ -399,7 +472,6 @@ class SAMParser:
 
             data = b""
             if inline:
-                # Inline data is stored in the data_rel field itself
                 data = struct.pack("<I", data_rel)[:data_len]
             else:
                 data_abs = rel_to_abs(data_rel)
@@ -421,7 +493,6 @@ class SAMParser:
             return None
 
     def get_vk_list(self, nk):
-        """Return list of VK records belonging to an NK."""
         vks = []
         if nk.value_count == 0 or nk.value_list_rel in (0, 0xFFFFFFFF):
             return vks
@@ -444,108 +515,34 @@ class SAMParser:
         return vks
 
     # ------------------------------------------------------------------
-    # F value parsing (user metadata) – using common SAM offsets
-    # ------------------------------------------------------------------
-    def parse_f_value(self, f_data):
-        """Extract account information from the F value."""
-        if len(f_data) < 0x40:
-            return None
-
-        rid = u32(f_data, 0x00)
-        account_flags = u32(f_data, 0x08)
-        last_logon = u64(f_data, 0x10)
-        last_pwd_set = u64(f_data, 0x18)
-        account_expires = u64(f_data, 0x20)
-        last_failed_logon = u64(f_data, 0x28)
-        failed_logon_count = u32(f_data, 0x30)
-        logon_count = u32(f_data, 0x38)
-
-        # Decode flags
-        flags_list = []
-        if account_flags & UF_ACCOUNT_DISABLE:
-            flags_list.append("DISABLED")
-        if account_flags & UF_LOCKOUT:
-            flags_list.append("LOCKED_OUT")
-        if account_flags & UF_PASSWD_NOTREQD:
-            flags_list.append("PASSWORD_NOT_REQUIRED")
-        if account_flags & UF_PASSWD_CANT_CHANGE:
-            flags_list.append("PASSWORD_CANT_CHANGE")
-        if account_flags & UF_NORMAL_ACCOUNT:
-            flags_list.append("NORMAL_ACCOUNT")
-        if account_flags & UF_DONT_EXPIRE_PASSWD:
-            flags_list.append("PASSWORD_NEVER_EXPIRES")
-        if account_flags & UF_PASSWORD_EXPIRED:
-            flags_list.append("PASSWORD_EXPIRED")
-        # Add more if desired
-
-        return {
-            "rid": rid,
-            "account_flags": account_flags,
-            "flags_readable": ", ".join(flags_list) if flags_list else "None",
-            "last_logon": filetime_to_str(last_logon),
-            "last_pwd_set": filetime_to_str(last_pwd_set),
-            "account_expires": filetime_to_str(account_expires),
-            "last_failed_logon": filetime_to_str(last_failed_logon),
-            "failed_logon_count": failed_logon_count,
-            "logon_count": logon_count,
-        }
-
-    # ------------------------------------------------------------------
-    # V value parsing (username and hashes) – common offsets
-    # ------------------------------------------------------------------
-    def parse_v_value(self, v_data):
-        """
-        Parse the V value to extract username and password hashes.
-        These offsets are common for Windows 10/11. If they don't work,
-        use the hex dump to manually identify the correct fields.
-        """
-        if len(v_data) < 0x24:
-            return None
-
-        # Offsets based on typical SAM structure
-        username_len = u16(v_data, 0x00)
-        username_off = u16(v_data, 0x0C)
-        lm_off = u16(v_data, 0x1C)
-        lm_len = u16(v_data, 0x1E)
-        nt_off = u16(v_data, 0x20)
-        nt_len = u16(v_data, 0x22)
-
-        username = ""
-        if username_len > 0 and username_off + username_len <= len(v_data):
-            username = v_data[username_off:username_off + username_len].decode("utf-16le", errors="ignore").rstrip("\x00")
-
-        lm_blob = v_data[lm_off:lm_off + lm_len] if lm_len > 0 else b""
-        nt_blob = v_data[nt_off:nt_off + nt_len] if nt_len > 0 else b""
-
-        return {
-            "username": username,
-            "lm_blob": lm_blob,
-            "nt_blob": nt_blob,
-        }
-
-    # ------------------------------------------------------------------
-    # Main user extraction routine
+    # Main user extraction (modified to save CSV when hex dump is printed)
     # ------------------------------------------------------------------
     def extract_users(self):
         print("\n[*] Extracting user account data from SAM\\Domains\\Account\\Users")
-        users_nk = self.find_key_by_path("ROOT\\SAM\\Domains\\Account\\Users")
+        target_path = "ROOT\\SAM\\Domains\\Account\\Users"
+        users_nk = self.find_key_by_path(target_path)
         if not users_nk:
-            print("[-] Users key not found. Dumping all keys for manual inspection:")
-            for nk in self.nk_by_abs.values():
-                path = self.get_key_path(nk)
-                if "Users" in path:
-                    print(f"    {path} (rel=0x{nk.rel_off:08X})")
-            # Try to fall back to the known Users key at rel 0x00002990
-            fallback_abs = rel_to_abs(0x00002990)
-            if fallback_abs in self.nk_by_abs:
-                users_nk = self.nk_by_abs[fallback_abs]
-                print(f"[*] Using fallback Users key at rel=0x00002990")
-            else:
-                return
+            print("[-] Users key not found.")
+            return
 
         print(f"[+] Found Users key at rel=0x{users_nk.rel_off:08X}")
         child_offsets = self.parse_subkey_list(users_nk.subkey_list_rel, users_nk.subkey_count)
         print(f"[+] Found {len(child_offsets)} subkeys under Users")
+
+        names_nk = self.find_key_by_path("ROOT\\SAM\\Domains\\Account\\Users\\Names")
+        if names_nk:
+            print("\n[*] Usernames found under Names:")
+            name_offsets = self.parse_subkey_list(names_nk.subkey_list_rel, names_nk.subkey_count)
+            for off in name_offsets:
+                name_nk = self.nk_by_abs.get(off)
+                if name_nk:
+                    ts = filetime_to_str(name_nk.timestamp)
+                    print(f"    {name_nk.name}  rel=0x{name_nk.rel_off:08X}  timestamp={ts}")
+
+        # Create a directory for CSV dumps
+        csv_dir = "hex_dumps"
+        if not os.path.exists(csv_dir):
+            os.makedirs(csv_dir)
 
         for child_abs in child_offsets:
             nk = self.nk_by_abs.get(child_abs)
@@ -558,16 +555,17 @@ class SAMParser:
 
             path = self.get_key_path(nk)
             vks = self.get_vk_list(nk)
-            if not vks:
-                continue
 
             print(f"\n[+] RID key: {nk.name} (RID {rid})")
             print(f"    Path      : {path}")
             print(f"    Timestamp : {filetime_to_str(nk.timestamp)}")
             print(f"    Values    : {len(vks)}")
 
-            f_vk = None
-            v_vk = None
+            if not vks:
+                print("    [!] No VK records parsed safely from this RID key")
+                continue
+
+            f_vk = v_vk = None
             for vk in vks:
                 type_name = REG_TYPES.get(vk.value_type, f"UNKNOWN({vk.value_type})")
                 print(f"      VK name={vk.name!r} type={type_name} len={vk.data_len} inline={vk.inline}")
@@ -576,35 +574,55 @@ class SAMParser:
                 elif vk.name == "V":
                     v_vk = vk
 
+            # ----- F value parsing -----
             if f_vk:
                 print(f"      F bytes (first 32): {f_vk.data[:32].hex()}")
-                f_info = self.parse_f_value(f_vk.data)
+                f_info = auto_parse_f(f_vk.data, rid)
                 if f_info:
-                    print(f"        RID in F           : {f_info['rid']}")
-                    print(f"        Account flags      : 0x{f_info['account_flags']:08X} ({f_info['flags_readable']})")
-                    print(f"        Last logon         : {f_info['last_logon']}")
-                    print(f"        Last password set  : {f_info['last_pwd_set']}")
-                    print(f"        Account expires    : {f_info['account_expires']}")
-                    print(f"        Last failed logon  : {f_info['last_failed_logon']}")
-                    print(f"        Failed logon count : {f_info['failed_logon_count']}")
-                    print(f"        Logon count        : {f_info['logon_count']}")
+                    print(f"        [Auto] Found RID at offset 0x{f_info['offsets']['rid']:X}")
+                    self._print_f_info(f_info)
                 else:
-                    print("        Could not parse F value (offsets may need calibration).")
+                    print("        Could not parse F value automatically.")
+                    # Print hex dump and save CSV
+                    hex_dump(f_vk.data, f"F value for {nk.name}")
+                    csv_filename = os.path.join(csv_dir, f"F_value_RID_{rid}.csv")
+                    save_hex_dump_csv(f_vk.data, csv_filename)
 
+            # ----- V value parsing -----
             if v_vk:
                 print(f"      V bytes (first 32): {v_vk.data[:32].hex()}")
-                v_info = self.parse_v_value(v_vk.data)
+                v_info = auto_parse_v(v_vk.data)
                 if v_info and v_info['username']:
-                    print(f"        Username  : {v_info['username']}")
-                    print(f"        LM blob   : {v_info['lm_blob'].hex()}")
-                    print(f"        NT blob   : {v_info['nt_blob'].hex()}")
+                    print(f"        [Auto] Found username at offset 0x{v_info['offsets']['name']:X}")
+                    if 'hash' in v_info['offsets']:
+                        print(f"                hashes at offset 0x{v_info['offsets']['hash']:X}")
+                    self._print_v_info(v_info)
                 else:
-                    print("      Could not parse V value with current offsets.")
-                    print("      Full V data (for manual analysis):")
+                    print("        Could not parse V value automatically.")
+                    # Print hex dump and save CSV
                     hex_dump(v_vk.data, f"V value for {nk.name}")
+                    csv_filename = os.path.join(csv_dir, f"V_value_RID_{rid}.csv")
+                    save_hex_dump_csv(v_vk.data, csv_filename)
+
+    def _print_f_info(self, f_info):
+        print(f"        RID in F           : {f_info['rid']}")
+        print(f"        Account flags      : 0x{f_info['account_flags']:08X} ({f_info['flags_readable']})")
+        print(f"        Last logon         : {f_info['last_logon']}")
+        print(f"        Last password set  : {f_info['last_pwd_set']}")
+        print(f"        Account expires    : {f_info['account_expires']}")
+        print(f"        Last failed logon  : {f_info['last_failed_logon']}")
+        print(f"        Failed logon count : {f_info['failed_logon_count']}")
+        print(f"        Logon count        : {f_info['logon_count']}")
+
+    def _print_v_info(self, v_info):
+        print(f"        Username  : {v_info['username']}")
+        lm = v_info.get('lm_blob', b'')
+        nt = v_info.get('nt_blob', b'')
+        print(f"        LM blob   : {lm.hex()}")
+        print(f"        NT blob   : {nt.hex()}")
 
     # ------------------------------------------------------------------
-    # Search for interesting keys (optional)
+    # Search for interesting keys (optional, unchanged)
     # ------------------------------------------------------------------
     def search_interesting(self):
         print("\n[*] Searching for interesting names directly")
