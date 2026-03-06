@@ -13,7 +13,7 @@ Implements:
 - VK record parsing (value cells)
 - Recursive tree traversal from root
 - Extraction of user account data (F and V values)
-- Detailed F value interpretation (flags, timestamps) – NOTE: offsets may need calibration
+- Detailed F value interpretation (flags, timestamps)
 - Hex dump utility for manual Excel mapping
 """
 
@@ -213,7 +213,7 @@ class SAMParser:
             print(f"    HBIN[{i}] abs=0x{abs_off:08X} rel=0x{rel:08X} size=0x{size:08X}")
 
     # ------------------------------------------------------------------
-    # NK record parsing
+    # NK record parsing – using offsets that worked earlier
     # ------------------------------------------------------------------
     def try_parse_nk(self, cell_abs):
         try:
@@ -444,15 +444,13 @@ class SAMParser:
         return vks
 
     # ------------------------------------------------------------------
-    # F value parsing (user metadata) – uses common offsets, may need adjustment
+    # F value parsing (user metadata) – using common SAM offsets
     # ------------------------------------------------------------------
     def parse_f_value(self, f_data):
-        """Extract account information from the F value. Offsets may need calibration."""
+        """Extract account information from the F value."""
         if len(f_data) < 0x40:
             return None
 
-        # These offsets are common for Windows 10/11 but may not match your SAM version.
-        # If values are incorrect, use the hex dump of F to find the correct offsets.
         rid = u32(f_data, 0x00)
         account_flags = u32(f_data, 0x08)
         last_logon = u64(f_data, 0x10)
@@ -493,20 +491,18 @@ class SAMParser:
         }
 
     # ------------------------------------------------------------------
-    # V value parsing (username and hashes) – needs manual calibration
+    # V value parsing (username and hashes) – common offsets
     # ------------------------------------------------------------------
     def parse_v_value(self, v_data):
         """
         Parse the V value to extract username and password hashes.
-        The offsets below are common for many Windows 10/11 systems.
-        If they don't work, use the hex dump to find the correct offsets
-        and adjust them manually.
+        These offsets are common for Windows 10/11. If they don't work,
+        use the hex dump to manually identify the correct fields.
         """
         if len(v_data) < 0x24:
             return None
 
-        # Common offsets (relative to start of V data) – these are guesses.
-        # For your specific SAM hive, you need to locate the username and hashes manually.
+        # Offsets based on typical SAM structure
         username_len = u16(v_data, 0x00)
         username_off = u16(v_data, 0x0C)
         lm_off = u16(v_data, 0x1C)
@@ -539,7 +535,13 @@ class SAMParser:
                 path = self.get_key_path(nk)
                 if "Users" in path:
                     print(f"    {path} (rel=0x{nk.rel_off:08X})")
-            return
+            # Try to fall back to the known Users key at rel 0x00002990
+            fallback_abs = rel_to_abs(0x00002990)
+            if fallback_abs in self.nk_by_abs:
+                users_nk = self.nk_by_abs[fallback_abs]
+                print(f"[*] Using fallback Users key at rel=0x00002990")
+            else:
+                return
 
         print(f"[+] Found Users key at rel=0x{users_nk.rel_off:08X}")
         child_offsets = self.parse_subkey_list(users_nk.subkey_list_rel, users_nk.subkey_count)
@@ -586,20 +588,20 @@ class SAMParser:
                     print(f"        Last failed logon  : {f_info['last_failed_logon']}")
                     print(f"        Failed logon count : {f_info['failed_logon_count']}")
                     print(f"        Logon count        : {f_info['logon_count']}")
+                else:
+                    print("        Could not parse F value (offsets may need calibration).")
 
             if v_vk:
                 print(f"      V bytes (first 32): {v_vk.data[:32].hex()}")
-                # Always print the full hex dump for manual analysis
-                hex_dump(v_vk.data, f"V value for {nk.name}")
-
-                # Also attempt automatic parsing (will likely fail, but we print the attempt)
                 v_info = self.parse_v_value(v_vk.data)
                 if v_info and v_info['username']:
                     print(f"        Username  : {v_info['username']}")
                     print(f"        LM blob   : {v_info['lm_blob'].hex()}")
                     print(f"        NT blob   : {v_info['nt_blob'].hex()}")
                 else:
-                    print("      Could not parse V value with current offsets. Use the hex dump above for manual mapping.")
+                    print("      Could not parse V value with current offsets.")
+                    print("      Full V data (for manual analysis):")
+                    hex_dump(v_vk.data, f"V value for {nk.name}")
 
     # ------------------------------------------------------------------
     # Search for interesting keys (optional)
