@@ -13,7 +13,7 @@ Implements:
 - VK record parsing (value cells)
 - Recursive tree traversal from root
 - Extraction of user account data (F and V values)
-- Detailed F value interpretation (flags, timestamps)
+- Detailed F value interpretation (flags, timestamps) – NOTE: offsets may need calibration
 - Hex dump utility for manual Excel mapping
 """
 
@@ -444,13 +444,15 @@ class SAMParser:
         return vks
 
     # ------------------------------------------------------------------
-    # F value parsing (user metadata)
+    # F value parsing (user metadata) – uses common offsets, may need adjustment
     # ------------------------------------------------------------------
     def parse_f_value(self, f_data):
-        """Extract account information from the F value."""
+        """Extract account information from the F value. Offsets may need calibration."""
         if len(f_data) < 0x40:
             return None
 
+        # These offsets are common for Windows 10/11 but may not match your SAM version.
+        # If values are incorrect, use the hex dump of F to find the correct offsets.
         rid = u32(f_data, 0x00)
         account_flags = u32(f_data, 0x08)
         last_logon = u64(f_data, 0x10)
@@ -503,7 +505,8 @@ class SAMParser:
         if len(v_data) < 0x24:
             return None
 
-        # Common offsets (relative to start of V data)
+        # Common offsets (relative to start of V data) – these are guesses.
+        # For your specific SAM hive, you need to locate the username and hashes manually.
         username_len = u16(v_data, 0x00)
         username_off = u16(v_data, 0x0C)
         lm_off = u16(v_data, 0x1C)
@@ -586,15 +589,17 @@ class SAMParser:
 
             if v_vk:
                 print(f"      V bytes (first 32): {v_vk.data[:32].hex()}")
+                # Always print the full hex dump for manual analysis
+                hex_dump(v_vk.data, f"V value for {nk.name}")
+
+                # Also attempt automatic parsing (will likely fail, but we print the attempt)
                 v_info = self.parse_v_value(v_vk.data)
                 if v_info and v_info['username']:
                     print(f"        Username  : {v_info['username']}")
                     print(f"        LM blob   : {v_info['lm_blob'].hex()}")
                     print(f"        NT blob   : {v_info['nt_blob'].hex()}")
                 else:
-                    print("      Could not parse V value with current offsets.")
-                    print("      Full V data (for manual analysis):")
-                    hex_dump(v_vk.data, f"V value for {nk.name}")
+                    print("      Could not parse V value with current offsets. Use the hex dump above for manual mapping.")
 
     # ------------------------------------------------------------------
     # Search for interesting keys (optional)
@@ -645,17 +650,6 @@ class SAMParser:
         self.scan_nks()
         self.search_interesting()
         self.extract_users()
-
-        # Optional: dump a hex block for Excel mapping (e.g., first user's V value)
-        # You can uncomment and adjust as needed.
-        # for nk in self.nk_by_abs.values():
-        #     if nk.name == "000001F4":   # Administrator
-        #         vks = self.get_vk_list(nk)
-        #         for vk in vks:
-        #             if vk.name == "V":
-        #                 hex_dump(vk.data, f"V value of {nk.name}")
-        #                 break
-        #         break
 
 
 # ----------------------------------------------------------------------
