@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-SAM Hive Parser – Final Reliable Version
+SAM Hive Parser – Final Reliable Version with Field Mapping
 NSSECU3 Mini Project 3
 Author: Your Name
 Date: March 2026
@@ -18,6 +18,7 @@ Implements:
 - Authoritative username source: SAM\Domains\Account\Users\Names
 - Hex dump output for manual Excel mapping
 - CSV export of parsed user data (including hash candidates)
+- **Field‑level offset mapping** for Excel colour coding
 """
 
 import sys
@@ -149,13 +150,16 @@ def auto_parse_v(v_data, expected_username=None):
                Otherwise, find the first plausible string.
     - Hash candidates: scan the entire V data for 16‑byte blocks with high entropy
                        (non‑zero, not all printable ASCII, at least 8 unique bytes).
-    Returns a dict with keys: username, username_offset, lm_blob, nt_blob.
+    Returns a dict with keys: username, username_offset, lm_blob, nt_blob,
+                              lm_offset, nt_offset.
     """
     result = {
         "username": "",
         "username_offset": None,
         "lm_blob": b"",
         "nt_blob": b"",
+        "lm_offset": None,
+        "nt_offset": None,
     }
 
     # ---- Find username ----
@@ -190,8 +194,10 @@ def auto_parse_v(v_data, expected_username=None):
     if hash_candidates:
         # Sort by offset and take first two as LM and NT candidates
         hash_candidates.sort()
+        result["lm_offset"] = hash_candidates[0][0]
         result["lm_blob"] = hash_candidates[0][1]
         if len(hash_candidates) > 1:
+            result["nt_offset"] = hash_candidates[1][0]
             result["nt_blob"] = hash_candidates[1][1]
 
     return result
@@ -199,7 +205,7 @@ def auto_parse_v(v_data, expected_username=None):
 def auto_parse_f_improved(f_data, expected_rid):
     """
     Parse the F value using known structure of USER_ACCOUNT.
-    Returns a dict with account flags, timestamps, etc.
+    Returns a dict with account flags, timestamps, etc., including offsets.
     """
     rid_bytes = struct.pack("<I", expected_rid)
     rid_off = None
@@ -254,6 +260,10 @@ def auto_parse_f_improved(f_data, expected_rid):
             "flags": struct_start + 0x38,
             "last_logon": struct_start + 0x08,
             "last_pwd_set": struct_start + 0x10,
+            "account_expires": struct_start + 0x18,
+            "last_failed_logon": struct_start + 0x20,
+            "failed_logon_count": struct_start + 0x28,
+            "logon_count": struct_start + 0x2C,
         }
     }
 
@@ -617,7 +627,72 @@ class SAMParser:
         return mapping
 
     # ------------------------------------------------------------------
-    # User extraction (main)
+    # New methods for field mapping
+    # ------------------------------------------------------------------
+    def _get_bytes_hex(self, abs_off, length):
+        """Return a hex string of `length` bytes starting at `abs_off`."""
+        if abs_off + length > len(self.data):
+            return "(out of range)"
+        return ' '.join(f"{b:02x}" for b in self.data[abs_off:abs_off+length])
+
+    def _print_field_mapping(self, rid, username, nk_abs, f_abs, f_info, v_abs, v_info):
+        """Print a nicely formatted table of absolute offsets for key fields."""
+        print("\n" + "="*60)
+        print(f"FIELD MAPPING FOR RID {rid} ({username})")
+        print("="*60)
+        print(f"{'Field':<25} {'Abs Offset':<12} {'Bytes (hex)':<50}")
+        print("-"*90)
+
+        # NK record (key)
+        print(f"{'NK record start':<25} {f'0x{nk_abs:04X}':<12} {self._get_bytes_hex(nk_abs, 4)} ...")
+        # NK timestamp (at +0x08)
+        ts_abs = nk_abs + 0x08
+        print(f"{'  NK timestamp':<25} {f'0x{ts_abs:04X}':<12} {self._get_bytes_hex(ts_abs, 8)}")
+
+        # F value data
+        print(f"{'F value start':<25} {f'0x{f_abs:04X}':<12} {self._get_bytes_hex(f_abs, 4)} ...")
+        # Cell size (first 4 bytes of F)
+        print(f"{'  Cell size':<25} {f'0x{f_abs:04X}':<12} {self._get_bytes_hex(f_abs, 4)}")
+        if f_info:
+            off = f_info['offsets']
+            # RID
+            rid_abs = f_abs + off['rid']
+            print(f"{'  RID':<25} {f'0x{rid_abs:04X}':<12} {self._get_bytes_hex(rid_abs, 4)}")
+            # Flags
+            flags_abs = f_abs + off['flags']
+            print(f"{'  Flags':<25} {f'0x{flags_abs:04X}':<12} {self._get_bytes_hex(flags_abs, 4)}")
+            # Timestamps
+            last_logon_abs = f_abs + off['last_logon']
+            print(f"{'  Last logon':<25} {f'0x{last_logon_abs:04X}':<12} {self._get_bytes_hex(last_logon_abs, 8)}")
+            last_pwd_abs = f_abs + off['last_pwd_set']
+            print(f"{'  Last pwd set':<25} {f'0x{last_pwd_abs:04X}':<12} {self._get_bytes_hex(last_pwd_abs, 8)}")
+            expires_abs = f_abs + off['account_expires']
+            print(f"{'  Account expires':<25} {f'0x{expires_abs:04X}':<12} {self._get_bytes_hex(expires_abs, 8)}")
+            last_fail_abs = f_abs + off['last_failed_logon']
+            print(f"{'  Last failed logon':<25} {f'0x{last_fail_abs:04X}':<12} {self._get_bytes_hex(last_fail_abs, 8)}")
+            fail_count_abs = f_abs + off['failed_logon_count']
+            print(f"{'  Failed logon count':<25} {f'0x{fail_count_abs:04X}':<12} {self._get_bytes_hex(fail_count_abs, 4)}")
+            logon_count_abs = f_abs + off['logon_count']
+            print(f"{'  Logon count':<25} {f'0x{logon_count_abs:04X}':<12} {self._get_bytes_hex(logon_count_abs, 4)}")
+
+        # V value data
+        print(f"{'V value start':<25} {f'0x{v_abs:04X}':<12} {self._get_bytes_hex(v_abs, 4)} ...")
+        print(f"{'  Cell size':<25} {f'0x{v_abs:04X}':<12} {self._get_bytes_hex(v_abs, 4)}")
+        if v_info and v_info['username_offset'] is not None:
+            user_abs = v_abs + v_info['username_offset']
+            # Show up to 16 bytes of username
+            user_len = min(16, len(v_info['username'])*2)
+            print(f"{'  Username':<25} {f'0x{user_abs:04X}':<12} {self._get_bytes_hex(user_abs, user_len)} ...")
+        if v_info and v_info['lm_offset'] is not None:
+            lm_abs = v_abs + v_info['lm_offset']
+            print(f"{'  LM hash (candidate)':<25} {f'0x{lm_abs:04X}':<12} {self._get_bytes_hex(lm_abs, 16)}")
+        if v_info and v_info['nt_offset'] is not None:
+            nt_abs = v_abs + v_info['nt_offset']
+            print(f"{'  NT hash (candidate)':<25} {f'0x{nt_abs:04X}':<12} {self._get_bytes_hex(nt_abs, 16)}")
+        print("="*60 + "\n")
+
+    # ------------------------------------------------------------------
+    # User extraction (main) – modified to call mapping
     # ------------------------------------------------------------------
     def extract_users(self):
         print("\n[*] Extracting user account data from SAM\\Domains\\Account\\Users")
@@ -688,9 +763,16 @@ class SAMParser:
                 "v_match": False
             }
 
+            f_abs_start = None
+            v_abs_start = None
+            f_info = None
+            v_info = None
+
             # ----- F value -----
             if f_vk:
-                hex_dump(f_vk.data, f"F value for {nk.name} (RID {rid})", f_vk.data_rel)
+                # Absolute offset of F data
+                f_abs_start = f_vk.data_rel + FIRST_HBIN_ABS
+                hex_dump(f_vk.data, f"F value for {nk.name} (RID {rid})", f_abs_start)
                 f_info = auto_parse_f_improved(f_vk.data, rid)
                 if f_info:
                     self._print_f_info(f_info)
@@ -708,7 +790,8 @@ class SAMParser:
 
             # ----- V value -----
             if v_vk:
-                hex_dump(v_vk.data, f"V value for {nk.name} (RID {rid})", v_vk.data_rel)
+                v_abs_start = v_vk.data_rel + FIRST_HBIN_ABS
+                hex_dump(v_vk.data, f"V value for {nk.name} (RID {rid})", v_abs_start)
                 v_info = auto_parse_v(v_vk.data, expected_username=username if username else None)
                 if v_info and v_info['username']:
                     print(f"        [Auto] Found username at offset 0x{v_info['username_offset']:X}")
@@ -723,6 +806,10 @@ class SAMParser:
                         print(f"        [!] Username mismatch: V says '{v_info['username']}', Names says '{username}'")
                 else:
                     print("        Could not parse V value automatically. Use the hex dump above for manual mapping.")
+
+            # ----- Print field mapping for Excel -----
+            if f_abs_start is not None and v_abs_start is not None:
+                self._print_field_mapping(rid, username, nk.abs_off, f_abs_start, f_info, v_abs_start, v_info)
 
             results.append(user_rec)
 
