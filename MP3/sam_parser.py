@@ -3,7 +3,7 @@
 r"""
 SAM Hive Parser – Final Reliable Version with Field Mapping
 NSSECU3 Mini Project 3
-Author: Your Name
+Author: GROUP 7
 Date: March 2026
 
 Implements:
@@ -145,14 +145,30 @@ def auto_find_utf16_string(data, target=None, min_len=3, max_len=64):
 
 def auto_parse_v(v_data, expected_username=None):
     """
-    Extract username and high‑entropy 16‑byte blocks (hash candidates) from V data.
-    - Username: if expected_username provided, search for that exact string.
-               Otherwise, find the first plausible string.
-    - Hash candidates: scan the entire V data for 16‑byte blocks with high entropy
-                       (non‑zero, not all printable ASCII, at least 8 unique bytes).
-    Returns a dict with keys: username, username_offset, lm_blob, nt_blob,
-                              lm_offset, nt_offset.
+    Extract username and hash blobs from V value data using the structured V header.
+
+    The V value binary layout (all offsets relative to start of v_data which
+    includes the 4-byte cell-size prefix):
+
+        v_data[0:4]          – cell size (negative int32, skip it)
+        v_data[4:]           – V payload (the actual SAM_USER_ACCOUNT_V struct)
+
+    Within the V payload, each user-data field is described by a 12-byte entry
+    (offset DWORD, length DWORD, type DWORD).  The table starts at V_payload+0x00
+    and data strings are stored at  V_payload + 0xCC + field_offset.
+
+    Entry positions in the header table (relative to V_payload start):
+        +0x0C  username   (offset + length + type)
+        +0x90  LM hash    (offset + length + type)
+        +0x9C  NT hash    (offset + length + type)
+
+    Returns dict: username, username_offset, lm_blob, nt_blob,
+                  lm_offset, nt_offset  (all *absolute within v_data*).
     """
+    # v_data includes the 4-byte cell header; V payload starts at offset 4
+    V_HDR  = 4        # bytes to skip for cell header
+    V_BASE = V_HDR + 0xCC   # base of the string/hash data area within v_data
+
     result = {
         "username": "",
         "username_offset": None,
@@ -162,43 +178,42 @@ def auto_parse_v(v_data, expected_username=None):
         "nt_offset": None,
     }
 
-    # ---- Find username ----
-    if expected_username:
-        off, _, found = auto_find_utf16_string(v_data, target=expected_username)
-        if off is not None:
-            result["username"] = found
-            result["username_offset"] = off
+    # Minimum size check: need at least up to the NT-hash entry (+0x9C+12 = 0xA8)
+    if len(v_data) < V_HDR + 0xA8:
+        return None
+
+    # ── Username (entry at V_payload+0x0C) ──────────────────────────────────
+    usr_off = u32(v_data, V_HDR + 0x0C)   # relative offset inside data area
+    usr_len = u32(v_data, V_HDR + 0x10)   # byte length of the UTF-16LE string
+
+    if 0 < usr_len <= 512:
+        ustart = V_BASE + usr_off
+        if ustart + usr_len <= len(v_data):
+            uname = v_data[ustart:ustart + usr_len].decode("utf-16le",
+                                                            errors="ignore")
+            result["username"] = uname
+            result["username_offset"] = ustart
+
     if not result["username"]:
-        off, _, s = auto_find_utf16_string(v_data)
-        if off is None:
-            return None
-        result["username"] = s
-        result["username_offset"] = off
+        return None   # no usable username → skip this record
 
-    # ---- Scan for hash blocks ----
-    username_end = result["username_offset"] + len(result["username"]) * 2
-    hash_candidates = []
+    # ── LM hash blob (entry at V_payload+0x90) ──────────────────────────────
+    lm_off = u32(v_data, V_HDR + 0x90)
+    lm_len = u32(v_data, V_HDR + 0x94)
+    if 0 < lm_len <= 64:
+        lstart = V_BASE + lm_off
+        if lstart + lm_len <= len(v_data):
+            result["lm_blob"]   = v_data[lstart:lstart + lm_len]
+            result["lm_offset"] = lstart
 
-    # Slide a 16‑byte window across the whole V data
-    for i in range(0, len(v_data) - 15):
-        # Skip if this window overlaps the username region
-        if i < username_end and i + 16 > result["username_offset"]:
-            continue
-        block = v_data[i:i+16]
-        # Heuristic for a non‑trivial, non‑ASCII block
-        if (all(b != 0 for b in block) and
-            not all(0x20 <= b <= 0x7E for b in block) and
-            entropyish(block) >= 8):
-            hash_candidates.append((i, block))
-
-    if hash_candidates:
-        # Sort by offset and take first two as LM and NT candidates
-        hash_candidates.sort()
-        result["lm_offset"] = hash_candidates[0][0]
-        result["lm_blob"] = hash_candidates[0][1]
-        if len(hash_candidates) > 1:
-            result["nt_offset"] = hash_candidates[1][0]
-            result["nt_blob"] = hash_candidates[1][1]
+    # ── NT hash blob (entry at V_payload+0x9C) ──────────────────────────────
+    nt_off = u32(v_data, V_HDR + 0x9C)
+    nt_len = u32(v_data, V_HDR + 0xA0)
+    if 0 < nt_len <= 64:
+        nstart = V_BASE + nt_off
+        if nstart + nt_len <= len(v_data):
+            result["nt_blob"]   = v_data[nstart:nstart + nt_len]
+            result["nt_offset"] = nstart
 
     return result
 
@@ -227,22 +242,47 @@ def auto_parse_f_improved(f_data, expected_rid):
             return u64(f_data, struct_start + off)
         return 0
 
-    last_logon = get_qword(0x08)
-    last_pwd_set = get_qword(0x10)
-    account_expires = get_qword(0x18)
-    last_failed_logon = get_qword(0x20)
-    failed_logon_count = get_dword(0x28)
-    logon_count = get_dword(0x2C)
-    rid = get_dword(0x30)
-    account_flags = get_dword(0x38)
+    last_logon        = get_qword(0x08)   # payload+0x08  LastLogon FILETIME
+    # payload+0x10 = LastLogoff (not displayed)
+    last_pwd_set      = get_qword(0x18)   # payload+0x18  PasswordLastSet FILETIME
+    account_expires   = get_qword(0x20)   # payload+0x20  AccountExpires FILETIME
+    last_failed_logon = get_qword(0x28)   # payload+0x28  LastBadPasswordTime FILETIME
+    # payload+0x30 = RID (anchor used above)
+    # payload+0x34 = PrimaryGroupId  (NOT logon count!)
+    # payload+0x38 = ACB flags
+    # payload+0x3C = CountryCode (WORD) + CodePage (WORD)
+    # payload+0x40 = BadPasswordCount (WORD)
+    # payload+0x42 = LogonCount (WORD)
+    rid                = get_dword(0x30)
+    account_flags      = get_dword(0x38)   # ACB flags at +0x38
+    failed_logon_count = struct.unpack_from("<H", f_data, struct_start + 0x40)[0]
+    logon_count        = struct.unpack_from("<H", f_data, struct_start + 0x42)[0]
+
+    # SAM ACB flag bit definitions (different from UF_ constants used in AD/LDAP)
+    ACB_DISABLED   = 0x0001   # Account Disabled
+    ACB_HOMEDIR    = 0x0002   # Home Directory Required
+    ACB_PASSWD_NR  = 0x0004   # Password Not Required
+    ACB_TEMP_DUP   = 0x0008   # Temp Duplicate Account
+    ACB_NORMAL     = 0x0010   # Normal User Account
+    ACB_MNS        = 0x0020   # MNS Logon Account
+    ACB_DOMTRUST   = 0x0040   # Interdomain Trust Account
+    ACB_WSTRUST    = 0x0080   # Workstation Trust Account
+    ACB_SVRTRUST   = 0x0100   # Server Trust Account
+    ACB_PWNOEXP    = 0x0200   # Password Does Not Expire
+    ACB_AUTOLOCK   = 0x0400   # Account Auto Locked
 
     flags_list = []
-    if account_flags & UF_ACCOUNT_DISABLE:   flags_list.append("DISABLED")
-    if account_flags & UF_LOCKOUT:           flags_list.append("LOCKED_OUT")
-    if account_flags & UF_PASSWD_NOTREQD:    flags_list.append("PASSWORD_NOT_REQUIRED")
-    if account_flags & UF_NORMAL_ACCOUNT:    flags_list.append("NORMAL_ACCOUNT")
-    if account_flags & UF_DONT_EXPIRE_PASSWD: flags_list.append("PASSWORD_NEVER_EXPIRES")
-    if account_flags & UF_PASSWORD_EXPIRED:  flags_list.append("PASSWORD_EXPIRED")
+    if account_flags & ACB_DISABLED:  flags_list.append("DISABLED")
+    if account_flags & ACB_HOMEDIR:   flags_list.append("HOMEDIR_REQUIRED")
+    if account_flags & ACB_PASSWD_NR: flags_list.append("PASSWORD_NOT_REQUIRED")
+    if account_flags & ACB_TEMP_DUP:  flags_list.append("TEMP_DUPLICATE")
+    if account_flags & ACB_NORMAL:    flags_list.append("NORMAL_ACCOUNT")
+    if account_flags & ACB_MNS:       flags_list.append("MNS_LOGON")
+    if account_flags & ACB_DOMTRUST:  flags_list.append("INTERDOMAIN_TRUST")
+    if account_flags & ACB_WSTRUST:   flags_list.append("WORKSTATION_TRUST")
+    if account_flags & ACB_SVRTRUST:  flags_list.append("SERVER_TRUST")
+    if account_flags & ACB_PWNOEXP:   flags_list.append("PASSWORD_NEVER_EXPIRES")
+    if account_flags & ACB_AUTOLOCK:  flags_list.append("AUTO_LOCKED")
 
     return {
         "rid": rid,
@@ -256,14 +296,14 @@ def auto_parse_f_improved(f_data, expected_rid):
         "logon_count": logon_count,
         "offsets": {
             "struct_start": struct_start,
-            "rid": rid_off,
-            "flags": struct_start + 0x38,
-            "last_logon": struct_start + 0x08,
-            "last_pwd_set": struct_start + 0x10,
-            "account_expires": struct_start + 0x18,
-            "last_failed_logon": struct_start + 0x20,
-            "failed_logon_count": struct_start + 0x28,
-            "logon_count": struct_start + 0x2C,
+            "rid":               rid_off,
+            "flags":             struct_start + 0x38,
+            "last_logon":        struct_start + 0x08,
+            "last_pwd_set":      struct_start + 0x18,
+            "account_expires":   struct_start + 0x20,
+            "last_failed_logon": struct_start + 0x28,
+            "failed_logon_count":struct_start + 0x40,
+            "logon_count":       struct_start + 0x42,
         }
     }
 
@@ -365,8 +405,10 @@ class SAMParser:
             parent_rel = u32(self.data, cell_abs + 0x14)
             subkey_count = u32(self.data, cell_abs + 0x18)
             subkey_list_rel = u32(self.data, cell_abs + 0x20)
-            value_count = u32(self.data, cell_abs + 0x24)
-            value_list_rel = u32(self.data, cell_abs + 0x28)
+            # +0x24 = volatile subkey list (always 0xFFFFFFFF if none) — NOT value_count
+            # +0x28 = actual value count,  +0x2C = value list relative offset
+            value_count = u32(self.data, cell_abs + 0x28)
+            value_list_rel = u32(self.data, cell_abs + 0x2C)
 
             name_len = u16(self.data, cell_abs + 0x4C)
             name_start = cell_abs + 0x50
@@ -577,7 +619,9 @@ class SAMParser:
 
     def get_vk_list(self, nk):
         vks = []
-        if nk.value_count > 20 or nk.value_count == 4294967295:
+        # With corrected NK offsets, value_count is now accurate.
+        # Keep the guard for genuinely corrupt hives (threshold raised to 128).
+        if nk.value_count > 128 or nk.value_count == 4294967295:
             print(f"    [!] Suspicious value_count={nk.value_count}, scanning nearby...")
             return self.scan_vk_near_nk(nk)
 
@@ -589,7 +633,8 @@ class SAMParser:
             return vks
 
         for i in range(nk.value_count):
-            off_pos = list_abs + i * 4
+            # +4 to skip the 4-byte cell-size header that precedes the pointer array
+            off_pos = list_abs + 4 + i * 4
             if off_pos + 4 > len(self.data):
                 break
             vk_rel = u32(self.data, off_pos)
@@ -620,9 +665,12 @@ class SAMParser:
             # The default value contains the RID (binary DWORD)
             vks = self.get_vk_list(name_nk)
             for vk in vks:
-                if vk.name == "" and vk.value_type == 3 and vk.data_len == 4:
-                    rid = u32(vk.data, 0)
-                    mapping[rid] = name_nk.name
+                # In SAM Names subkeys the default value's TYPE field holds the RID
+                # (data_len is 0 / inline flag set; actual type encodes the RID integer)
+                if vk.name == "":
+                    rid = vk.value_type   # overloaded: type == RID
+                    if rid > 0:
+                        mapping[rid] = name_nk.name
                     break
         return mapping
 
